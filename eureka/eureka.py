@@ -4,12 +4,12 @@ import json
 import logging 
 import matplotlib.pyplot as plt
 import os
-import openai
 import re
 import subprocess
 from pathlib import Path
 import shutil
 import time 
+import anthropic
 
 from utils.misc import * 
 from utils.file_utils import find_files_with_substring, load_tensorboard_logs
@@ -25,12 +25,13 @@ def main(cfg):
     logging.info(f"Workspace: {workspace_dir}")
     logging.info(f"Project Root: {EUREKA_ROOT_DIR}")
 
-    openai.api_key = os.getenv("OPENAI_API_KEY")
+    # Initialize Anthropic client
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     task = cfg.env.task
     task_description = cfg.env.description
     suffix = cfg.suffix
-    model = cfg.model
+    model = cfg.get('model', 'claude-sonnet-4-20250514')  # Default to Claude Sonnet 4
     logging.info(f"Using LLM: {model}")
     logging.info("Task: " + task)
     logging.info("Task description: " + task_description)
@@ -56,7 +57,9 @@ def main(cfg):
 
     initial_system = initial_system.format(task_reward_signature_string=reward_signature) + code_output_tip
     initial_user = initial_user.format(task_obs_code_string=task_obs_code_string, task_description=task_description)
-    messages = [{"role": "system", "content": initial_system}, {"role": "user", "content": initial_user}]
+    
+    # Claude uses a different message format - system prompt is separate
+    messages = [{"role": "user", "content": initial_user}]
 
     task_code_string = task_code_string.replace(task, task+suffix)
     # Create Task YAML files
@@ -73,49 +76,54 @@ def main(cfg):
     
     # Eureka generation loop
     for iter in range(cfg.iteration):
-        # Get Eureka response
+        # Get Claude response
         responses = []
-        response_cur = None
         total_samples = 0
-        total_token = 0
-        total_completion_token = 0
-        chunk_size = cfg.sample if "gpt-3.5" in model else 4
+        total_input_tokens = 0
+        total_output_tokens = 0
 
-        logging.info(f"Iteration {iter}: Generating {cfg.sample} samples with {cfg.model}")
+        logging.info(f"Iteration {iter}: Generating {cfg.sample} samples with {model}")
 
-        while True:
-            if total_samples >= cfg.sample:
-                break
+        # Claude API doesn't support batch sampling, so we make multiple calls
+        for sample_idx in range(cfg.sample):
             for attempt in range(1000):
                 try:
-                    response_cur = openai.ChatCompletion.create(
+                    response = client.messages.create(
                         model=model,
+                        max_tokens=4096,
+                        system=initial_system,
                         messages=messages,
-                        temperature=cfg.temperature,
-                        n=chunk_size
+                        temperature=cfg.get('temperature', 1.0)
                     )
-                    total_samples += chunk_size
+                    
+                    # Extract the text content from Claude's response
+                    content = ""
+                    for block in response.content:
+                        if block.type == "text":
+                            content += block.text
+                    
+                    responses.append({"message": {"content": content}})
+                    total_input_tokens += response.usage.input_tokens
+                    total_output_tokens += response.usage.output_tokens
+                    total_samples += 1
                     break
+                    
                 except Exception as e:
-                    if attempt >= 10:
-                        chunk_size = max(int(chunk_size / 2), 1)
-                        print("Current Chunk Size", chunk_size)
-                    logging.info(f"Attempt {attempt+1} failed with error: {e}")
+                    logging.info(f"Sample {sample_idx}, Attempt {attempt+1} failed with error: {e}")
                     time.sleep(1)
-            if response_cur is None:
+                    if attempt >= 10:
+                        logging.info("Too many failed attempts!")
+                        break
+            
+            if total_samples <= sample_idx:
                 logging.info("Code terminated due to too many failed attempts!")
                 exit()
 
-            responses.extend(response_cur["choices"])
-            prompt_tokens = response_cur["usage"]["prompt_tokens"]
-            total_completion_token += response_cur["usage"]["completion_tokens"]
-            total_token += response_cur["usage"]["total_tokens"]
-
         if cfg.sample == 1:
-            logging.info(f"Iteration {iter}: GPT Output:\n " + responses[0]["message"]["content"] + "\n")
+            logging.info(f"Iteration {iter}: Claude Output:\n " + responses[0]["message"]["content"] + "\n")
 
         # Logging Token Information
-        logging.info(f"Iteration {iter}: Prompt Tokens: {prompt_tokens}, Completion Tokens: {total_completion_token}, Total Tokens: {total_token}")
+        logging.info(f"Iteration {iter}: Input Tokens: {total_input_tokens}, Output Tokens: {total_output_tokens}")
         
         code_runs = [] 
         rl_runs = []
@@ -123,7 +131,7 @@ def main(cfg):
             response_cur = responses[response_id]["message"]["content"]
             logging.info(f"Iteration {iter}: Processing Code Run {response_id}")
 
-            # Regex patterns to extract python code enclosed in GPT response
+            # Regex patterns to extract python code enclosed in Claude response
             patterns = [
                 r'```python(.*?)```',
                 r'```(.*?)```',
@@ -306,7 +314,7 @@ def main(cfg):
 
         logging.info(f"Iteration {iter}: Max Success: {max_success}, Execute Rate: {execute_rate}, Max Success Reward Correlation: {max_success_reward_correlation}")
         logging.info(f"Iteration {iter}: Best Generation ID: {best_sample_idx}")
-        logging.info(f"Iteration {iter}: GPT Output Content:\n" +  responses[best_sample_idx]["message"]["content"] + "\n")
+        logging.info(f"Iteration {iter}: Claude Output Content:\n" +  responses[best_sample_idx]["message"]["content"] + "\n")
         logging.info(f"Iteration {iter}: User Content:\n" + best_content + "\n")
             
         # Plot the success rate
@@ -327,11 +335,11 @@ def main(cfg):
         plt.savefig('summary.png')
         np.savez('summary.npz', max_successes=max_successes, execute_rates=execute_rates, best_code_paths=best_code_paths, max_successes_reward_correlation=max_successes_reward_correlation)
 
-        if len(messages) == 2:
+        if len(messages) == 1:
             messages += [{"role": "assistant", "content": responses[best_sample_idx]["message"]["content"]}]
             messages += [{"role": "user", "content": best_content}]
         else:
-            assert len(messages) == 4
+            assert len(messages) == 3
             messages[-2] = {"role": "assistant", "content": responses[best_sample_idx]["message"]["content"]}
             messages[-1] = {"role": "user", "content": best_content}
 
