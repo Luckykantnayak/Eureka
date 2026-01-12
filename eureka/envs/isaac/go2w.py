@@ -50,7 +50,7 @@ class Go2w(VecTask):
 
         self.named_default_joint_angles = self.cfg["env"]["defaultJointAngles"]
 
-        self.cfg["env"]["numObservations"] = 60
+        self.cfg["env"]["numObservations"] = 56
         self.cfg["env"]["numActions"] = 16
 
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless, virtual_screen_capture=virtual_screen_capture, force_render=force_render)
@@ -93,7 +93,10 @@ class Go2w(VecTask):
         self.commands_x = self.commands.view(self.num_envs, 3)[..., 0]
         self.commands_yaw = self.commands.view(self.num_envs, 3)[..., 2]
         self.default_dof_pos = torch.zeros_like(self.dof_pos, dtype=torch.float, device=self.device, requires_grad=False)
-
+        
+        self.leg_dof_indices = torch.tensor([0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14],device=self.device,dtype=torch.long)
+        self.wheel_dof_indices = torch.tensor([3, 7, 11, 15],device=self.device,dtype=torch.long)
+        
         for i in range(self.cfg["env"]["numActions"]):
             name = self.dof_names[i]
             angle = self.named_default_joint_angles[name]
@@ -250,7 +253,9 @@ class Go2w(VecTask):
                                                         self.lin_vel_scale,
                                                         self.ang_vel_scale,
                                                         self.dof_pos_scale,
-                                                        self.dof_vel_scale
+                                                        self.dof_vel_scale,
+                                                        self.leg_dof_indices,
+                                                        self.wheel_dof_indices
         )
 
     def reset_idx(self, env_ids):
@@ -291,31 +296,36 @@ def compute_go2w_observations(root_states,
                                 lin_vel_scale,
                                 ang_vel_scale,
                                 dof_pos_scale,
-                                dof_vel_scale
+                                dof_vel_scale,
+                                leg_dof_indices,
+                                wheel_dof_indices
                                 ):
 
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, float, float, float) -> Tensor
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, float, float, float, Tensor, Tensor) -> Tensor
     base_quat = root_states[:, 3:7]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10]) * lin_vel_scale
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13]) * ang_vel_scale
     projected_gravity = quat_rotate(base_quat, gravity_vec)
-    dof_pos_scaled = (dof_pos - default_dof_pos) * dof_pos_scale
-    indices = torch.tensor(
-                [3, 7, 11, 15],
-                device=dof_pos_scaled.device,
-                dtype=torch.long
-            )
-
-    dof_pos_scaled.index_fill_(1, indices, 0.0)
+    leg_dof_pos_scaled = (dof_pos[:, leg_dof_indices] - default_dof_pos[:, leg_dof_indices]) * dof_pos_scale
+    leg_dof_vel_scaled = dof_vel[:, leg_dof_indices] * dof_vel_scale
+    
+    wheel_dof_vel_scaled = dof_vel[:, wheel_dof_indices] * dof_vel_scale
+    
     commands_scaled = commands*torch.tensor([lin_vel_scale, lin_vel_scale, ang_vel_scale], requires_grad=False, device=commands.device)
+    
+    leg_actions = actions[:, leg_dof_indices]
+    
+    wheel_actions = actions[:, wheel_dof_indices]
 
     obs = torch.cat((base_lin_vel,
                      base_ang_vel,
                      projected_gravity,
                      commands_scaled,
-                     dof_pos_scaled,
-                     dof_vel*dof_vel_scale,
-                     actions
+                     leg_dof_pos_scaled,
+                     leg_dof_vel_scaled,
+                     wheel_dof_vel_scaled,
+                     leg_actions,
+                     wheel_actions
                      ), dim=-1)
 
     return obs
