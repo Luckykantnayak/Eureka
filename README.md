@@ -1,4 +1,5 @@
-# Eureka: Human-Level Reward Design via Coding Large Language Models (ICLR 2024)
+# Eureka: Human-Level Reward Design via Coding Large Language Models (ICLR 2024)  
+## Go2W robot and Anthropic Claude Support
 
 <div align="center">
 
@@ -45,9 +46,9 @@ cd isaacgymenvs; pip install -e .
 cd ../rl_games; pip install -e .
 ```
 
-4. Eureka currently uses OpenAI API for language model queries. You need to have an OpenAI API key to use Eureka [here](https://platform.openai.com/account/api-keys)/. Then, set the environment variable in your terminal
+4. Eureka currently uses Anthropic API for language model queries. You need to have an Anthropic API key to use Eureka . Then, set the environment variable in your terminal
 ```
-export OPENAI_API_KEY= "YOUR_API_KEY"
+export ANTHROPIC_API_KEY= "YOUR_API_KEY"
 ```
 
 # Getting Started
@@ -63,10 +64,10 @@ python eureka.py env={environment} iteration={num_iterations} sample={num_sample
 
 Below are some example commands to try out Eureka:
 ```
-python eureka.py env=shadow_hand sample=4 iteration=2 model=gpt-4-0314
+python eureka.py env=shadow_hand sample=4 iteration=2 model=claude-opus-4-5-20251101
 ```
 ```
-python eureka.py env=humanoid sample=16 iteration=5 model=gpt-3.5-turbo-16k-0613
+python eureka.py env=humanoid sample=16 iteration=5 model=claude-opus-4-5-20251101
 ```
 Each run will create a timestamp folder in `eureka/outputs` that saves the Eureka log as well as all intermediate reward functions and associated policies.
 
