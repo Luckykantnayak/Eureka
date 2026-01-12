@@ -28,6 +28,7 @@
 
 from .ant import Ant
 from .anymal import Anymal
+from .go2w import Go2w
 from .anymal_terrain import AnymalTerrain
 from .ball_balance import BallBalance
 from .cartpole import Cartpole 
@@ -77,6 +78,7 @@ isaacgym_task_map = {
     "AllegroHandADR": AllegroHandDextremeADR,
     "Ant": Ant,
     "Anymal": Anymal,
+    "Go2w" : Go2w,
     "AnymalTerrain": AnymalTerrain,
     "BallBalance": BallBalance,
     "Cartpole": Cartpole,

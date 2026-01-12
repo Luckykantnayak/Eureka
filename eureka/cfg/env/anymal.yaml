@@ -1,4 +1,4 @@
 task: Anymal
 env_name: anymal
-description: to make the quadruped follow randomly chosen x,y, and yaw target velocities
+description: to make the quadruped follow randomly chosen x,y, and yaw target velocities while walking on two back legs
 max_iterations: 1000
