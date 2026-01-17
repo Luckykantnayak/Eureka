@@ -209,8 +209,9 @@ class Go2w(VecTask):
         
         for i in range(self.num_dof):
             dof_props['driveMode'][i] = gymapi.DOF_MODE_EFFORT
-            dof_props['stiffness'][i] = 0.0
-            dof_props['damping'][i] = 0.0
+            dof_props['stiffness'][i] = self.cfg["env"]["control"]["stiffness"] #self.Kp
+            dof_props['damping'][i] = self.cfg["env"]["control"]["damping"] #self.Kd
+
 
 
         env_lower = gymapi.Vec3(-spacing, -spacing, 0.0)

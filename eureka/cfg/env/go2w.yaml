@@ -1,4 +1,4 @@
 task: Go2w
 env_name: go2w
-description: to make the wheeled quadruped follow randomly chosen x,y, and yaw target velocities by lifting legs and pushing rather than using wheels to roll 
+description: to make the wheeled quadruped balance on two back legs and follow randomly chosen x,y, and yaw target velocities by  using wheels to roll
 max_iterations: 1000

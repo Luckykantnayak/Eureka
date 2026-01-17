@@ -50,7 +50,7 @@ class Go2wClaude(VecTask):
 
         self.named_default_joint_angles = self.cfg["env"]["defaultJointAngles"]
 
-        self.cfg["env"]["numObservations"] = 60
+        self.cfg["env"]["numObservations"] = 56
         self.cfg["env"]["numActions"] = 16
 
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless, virtual_screen_capture=virtual_screen_capture, force_render=force_render)
@@ -93,7 +93,10 @@ class Go2wClaude(VecTask):
         self.commands_x = self.commands.view(self.num_envs, 3)[..., 0]
         self.commands_yaw = self.commands.view(self.num_envs, 3)[..., 2]
         self.default_dof_pos = torch.zeros_like(self.dof_pos, dtype=torch.float, device=self.device, requires_grad=False)
-
+        
+        self.leg_dof_indices = torch.tensor([0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14],device=self.device,dtype=torch.long)
+        self.wheel_dof_indices = torch.tensor([3, 7, 11, 15],device=self.device,dtype=torch.long)
+        
         for i in range(self.cfg["env"]["numActions"]):
             name = self.dof_names[i]
             angle = self.named_default_joint_angles[name]
@@ -166,8 +169,9 @@ class Go2wClaude(VecTask):
         
         for i in range(self.num_dof):
             dof_props['driveMode'][i] = gymapi.DOF_MODE_EFFORT
-            dof_props['stiffness'][i] = 0.0
-            dof_props['damping'][i] = 0.0
+            dof_props['stiffness'][i] = self.cfg["env"]["control"]["stiffness"] #self.Kp
+            dof_props['damping'][i] = self.cfg["env"]["control"]["damping"] #self.Kd
+
 
         env_lower = gymapi.Vec3(-spacing, -spacing, 0.0)
         env_upper = gymapi.Vec3(spacing, spacing, spacing)
@@ -218,7 +222,7 @@ class Go2wClaude(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_vel, self.actions, self.gravity_vec)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_vel, self.actions, self.leg_dof_indices, self.wheel_dof_indices, self.gravity_vec)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
@@ -253,7 +257,9 @@ class Go2wClaude(VecTask):
                                                         self.lin_vel_scale,
                                                         self.ang_vel_scale,
                                                         self.dof_pos_scale,
-                                                        self.dof_vel_scale
+                                                        self.dof_vel_scale,
+                                                        self.leg_dof_indices,
+                                                        self.wheel_dof_indices
         )
 
     def reset_idx(self, env_ids):
@@ -294,31 +300,36 @@ def compute_go2w_observations(root_states,
                                 lin_vel_scale,
                                 ang_vel_scale,
                                 dof_pos_scale,
-                                dof_vel_scale
+                                dof_vel_scale,
+                                leg_dof_indices,
+                                wheel_dof_indices
                                 ):
 
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, float, float, float) -> Tensor
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, float, float, float, Tensor, Tensor) -> Tensor
     base_quat = root_states[:, 3:7]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10]) * lin_vel_scale
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13]) * ang_vel_scale
     projected_gravity = quat_rotate(base_quat, gravity_vec)
-    dof_pos_scaled = (dof_pos - default_dof_pos) * dof_pos_scale
-    indices = torch.tensor(
-                [3, 7, 11, 15],
-                device=dof_pos_scaled.device,
-                dtype=torch.long
-            )
-
-    dof_pos_scaled.index_fill_(1, indices, 0.0)
+    leg_dof_pos_scaled = (dof_pos[:, leg_dof_indices] - default_dof_pos[:, leg_dof_indices]) * dof_pos_scale
+    leg_dof_vel_scaled = dof_vel[:, leg_dof_indices] * dof_vel_scale
+    
+    wheel_dof_vel_scaled = dof_vel[:, wheel_dof_indices] * dof_vel_scale
+    
     commands_scaled = commands*torch.tensor([lin_vel_scale, lin_vel_scale, ang_vel_scale], requires_grad=False, device=commands.device)
+    
+    leg_actions = actions[:, leg_dof_indices]
+    
+    wheel_actions = actions[:, wheel_dof_indices]
 
     obs = torch.cat((base_lin_vel,
                      base_ang_vel,
                      projected_gravity,
                      commands_scaled,
-                     dof_pos_scaled,
-                     dof_vel*dof_vel_scale,
-                     actions
+                     leg_dof_pos_scaled,
+                     leg_dof_vel_scaled,
+                     wheel_dof_vel_scaled,
+                     leg_actions,
+                     wheel_actions
                      ), dim=-1)
 
     return obs
@@ -366,88 +377,137 @@ import math
 import torch
 from torch import Tensor
 @torch.jit.script
-def compute_reward(root_states: Tensor, 
-                   commands: Tensor, 
-                   dof_vel: Tensor,
-                   actions: Tensor,
-                   gravity_vec: Tensor) -> Tuple[Tensor, Dict[str, Tensor]]:
-    """
-    Reward function for velocity tracking task.
+def compute_reward(
+    root_states: torch.Tensor,
+    commands: torch.Tensor,
+    dof_vel: torch.Tensor,
+    actions: torch.Tensor,
+    leg_dof_indices: torch.Tensor,
+    wheel_dof_indices: torch.Tensor,
+    gravity_vec: torch.Tensor
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     
-    Args:
-        root_states: Robot root states [pos(3), quat(4), lin_vel(3), ang_vel(3)]
-        commands: Target velocities [vx, vy, yaw_rate]
-        dof_vel: Joint velocities
-        actions: Current actions
-        gravity_vec: Gravity vector in world frame
-    """
-    # Extract base quaternion and velocities
+    # Extract base velocities in body frame
     base_quat = root_states[:, 3:7]
-    base_lin_vel_world = root_states[:, 7:10]
-    base_ang_vel_world = root_states[:, 10:13]
+    base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
+    base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13])
     
-    # Convert to local frame using quaternion rotation
-    # quat_rotate_inverse equivalent
-    qw, qx, qy, qz = base_quat[:, 0:1], base_quat[:, 1:2], base_quat[:, 2:3], base_quat[:, 3:4]
+    # Target velocities from commands
+    target_lin_vel_x = commands[:, 0]
+    target_lin_vel_y = commands[:, 1]
+    target_ang_vel_z = commands[:, 2]
     
-    # Rotate linear velocity to local frame
-    q_vec = base_quat[:, 1:4]
-    a = base_lin_vel_world * (2.0 * qw * qw - 1.0)
-    b = torch.cross(q_vec, base_lin_vel_world, dim=-1) * qw * 2.0
-    c = q_vec * torch.sum(q_vec * base_lin_vel_world, dim=-1, keepdim=True) * 2.0
-    base_lin_vel = a - b + c
-    
-    # Rotate angular velocity to local frame
-    a_ang = base_ang_vel_world * (2.0 * qw * qw - 1.0)
-    b_ang = torch.cross(q_vec, base_ang_vel_world, dim=-1) * qw * 2.0
-    c_ang = q_vec * torch.sum(q_vec * base_ang_vel_world, dim=-1, keepdim=True) * 2.0
-    base_ang_vel = a_ang - b_ang + c_ang
-    
-    # Target velocities
-    target_vx = commands[:, 0]
-    target_vy = commands[:, 1]
-    target_yaw_rate = commands[:, 2]
+    # Current velocities
+    current_lin_vel_x = base_lin_vel[:, 0]
+    current_lin_vel_y = base_lin_vel[:, 1]
+    current_lin_vel_z = base_lin_vel[:, 2]
+    current_ang_vel_z = base_ang_vel[:, 2]
     
     # Velocity tracking errors
-    vx_error = torch.square(base_lin_vel[:, 0] - target_vx)
-    vy_error = torch.square(base_lin_vel[:, 1] - target_vy)
-    yaw_rate_error = torch.square(base_ang_vel[:, 2] - target_yaw_rate)
+    lin_vel_x_error = torch.square(current_lin_vel_x - target_lin_vel_x)
+    lin_vel_y_error = torch.square(current_lin_vel_y - target_lin_vel_y)
+    ang_vel_z_error = torch.square(current_ang_vel_z - target_ang_vel_z)
     
-    # Temperature parameters for exponential rewards
-    tracking_sigma_lin: float = 0.25
-    tracking_sigma_ang: float = 0.25
+    # Individual velocity tracking rewards with adjusted temperatures
+    vel_x_temp = 0.5  # Relaxed from 0.25
+    vel_y_temp = 0.25  # Keep as is (working well)
+    vel_yaw_temp = 0.75  # Relaxed significantly from 0.25
     
-    # Velocity tracking rewards (exponential for smooth gradients)
-    lin_vel_reward = torch.exp(-vx_error / tracking_sigma_lin) + torch.exp(-vy_error / tracking_sigma_lin)
-    ang_vel_reward = torch.exp(-yaw_rate_error / tracking_sigma_ang)
+    vel_x_reward = torch.exp(-lin_vel_x_error / vel_x_temp)
+    vel_y_reward = torch.exp(-lin_vel_y_error / vel_y_temp)
+    vel_yaw_reward = torch.exp(-ang_vel_z_error / vel_yaw_temp)
     
-    # Penalize large actions for energy efficiency
-    action_penalty_temp: float = 0.01
-    action_penalty = torch.sum(torch.square(actions), dim=-1) * action_penalty_temp
+    # Direction alignment reward - working well, keep it
+    commanded_speed = torch.sqrt(torch.square(target_lin_vel_x) + torch.square(target_lin_vel_y) + 1e-6)
+    current_speed = torch.sqrt(torch.square(current_lin_vel_x) + torch.square(current_lin_vel_y) + 1e-6)
     
-    # Penalize high joint velocities
-    dof_vel_penalty_temp: float = 0.0001
-    dof_vel_penalty = torch.sum(torch.square(dof_vel), dim=-1) * dof_vel_penalty_temp
+    cos_alignment = (current_lin_vel_x * target_lin_vel_x + current_lin_vel_y * target_lin_vel_y) / (current_speed * commanded_speed + 1e-6)
+    alignment_error = torch.square(1.0 - cos_alignment)
+    alignment_temp = 0.5
+    alignment_reward = torch.exp(-alignment_error / alignment_temp)
     
-    # Orientation penalty (penalize non-upright orientations)
-    projected_gravity = torch.zeros_like(gravity_vec)
-    projected_gravity[:, 0] = 2.0 * (qx * qz - qw * qy).squeeze()
-    projected_gravity[:, 1] = 2.0 * (qy * qz + qw * qx).squeeze()
-    projected_gravity[:, 2] = (1.0 - 2.0 * (qx * qx + qy * qy)).squeeze()
+    # Speed matching - working well, keep it
+    speed_error = torch.square(current_speed - commanded_speed)
+    speed_temp = 1.0
+    speed_reward = torch.exp(-speed_error / speed_temp)
     
-    orientation_penalty_temp: float = 1.0
-    orientation_penalty = torch.sum(torch.square(projected_gravity[:, :2]), dim=-1) * orientation_penalty_temp
+    # Wheel usage - reward wheel activity when commanded to move
+    wheel_velocities = dof_vel[:, wheel_dof_indices]
+    avg_wheel_speed = torch.mean(torch.abs(wheel_velocities), dim=-1)
     
-    # Total reward
-    reward = lin_vel_reward + ang_vel_reward - action_penalty - dof_vel_penalty - orientation_penalty
+    # Simple reward: wheels should spin when there's a movement command
+    commanded_motion = torch.abs(target_lin_vel_x) + torch.abs(target_lin_vel_y)
+    target_wheel_activity = commanded_motion > 0.05
     
-    # Reward components dictionary
-    reward_dict: Dict[str, Tensor] = {
-        "lin_vel_reward": lin_vel_reward,
-        "ang_vel_reward": ang_vel_reward,
-        "action_penalty": action_penalty,
-        "dof_vel_penalty": dof_vel_penalty,
-        "orientation_penalty": orientation_penalty
+    # Reward high wheel speed when moving, reward low wheel speed when stationary
+    wheel_activity_level = avg_wheel_speed / (commanded_speed + 0.1)
+    wheel_activity_error = torch.square(wheel_activity_level - 2.5)  # Target ratio
+    wheel_temp = 5.0
+    wheel_reward_active = torch.exp(-wheel_activity_error / wheel_temp)
+    
+    # When stationary, just check wheels aren't spinning too much
+    wheel_stationary_error = torch.square(avg_wheel_speed)
+    wheel_stationary_temp = 2.0
+    wheel_reward_stationary = torch.exp(-wheel_stationary_error / wheel_stationary_temp)
+    
+    wheel_usage_reward = torch.where(target_wheel_activity, wheel_reward_active, wheel_reward_stationary)
+    
+    # Stability rewards
+    projected_gravity = quat_rotate_inverse(base_quat, gravity_vec)
+    
+    # Roll stability - working well, keep it
+    roll_error = torch.square(projected_gravity[:, 1])
+    roll_temp = 0.3
+    roll_reward = torch.exp(-roll_error / roll_temp)
+    
+    # Pitch stability - working well, keep it
+    pitch_error = torch.square(projected_gravity[:, 0])
+    pitch_temp = 0.8
+    pitch_reward = torch.exp(-pitch_error / pitch_temp)
+    
+    # Angular stability - drastically relax
+    ang_vel_xy = torch.square(base_ang_vel[:, 0]) + torch.square(base_ang_vel[:, 1])
+    ang_vel_temp = 10.0  # Increased from 1.0
+    ang_stability_reward = torch.exp(-ang_vel_xy / ang_vel_temp)
+    
+    # Z velocity stability - working well, keep it
+    z_vel_error = torch.square(current_lin_vel_z)
+    z_vel_temp = 1.0
+    z_vel_reward = torch.exp(-z_vel_error / z_vel_temp)
+    
+    # Leg action penalty - specifically penalize leg movements
+    leg_actions = actions[:, leg_dof_indices]
+    leg_action_magnitude = torch.sum(torch.square(leg_actions), dim=-1)
+    leg_action_temp = 3.0
+    leg_action_reward = torch.exp(-leg_action_magnitude / leg_action_temp)
+    
+    # Total reward with increased weights to make score positive
+    reward = (
+        8.0 * vel_x_reward +          # Increased from 5.0
+        8.0 * vel_y_reward +          # Increased from 5.0
+        6.0 * vel_yaw_reward +        # Increased from 3.0
+        5.0 * alignment_reward +      # Increased from 3.0
+        3.0 * speed_reward +          # Increased from 2.0
+        2.0 * wheel_usage_reward +    # Increased from 1.5
+        3.0 * roll_reward +           # Increased from 2.0
+        2.0 * pitch_reward +          # Increased from 1.0
+        1.0 * ang_stability_reward +  # Same
+        1.0 * z_vel_reward +          # Increased from 0.5
+        0.5 * leg_action_reward       # Replaced leg_stability and action_reward
+    )
+    
+    reward_components = {
+        "vel_x_reward": vel_x_reward,
+        "vel_y_reward": vel_y_reward,
+        "vel_yaw_reward": vel_yaw_reward,
+        "alignment_reward": alignment_reward,
+        "speed_reward": speed_reward,
+        "wheel_usage_reward": wheel_usage_reward,
+        "roll_reward": roll_reward,
+        "pitch_reward": pitch_reward,
+        "ang_stability_reward": ang_stability_reward,
+        "z_vel_reward": z_vel_reward,
+        "leg_action_reward": leg_action_reward
     }
     
-    return reward, reward_dict
+    return reward, reward_components

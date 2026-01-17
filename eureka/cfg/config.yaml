@@ -9,7 +9,7 @@ hydra:
     chdir: True
 
 # LLM parameters
-model: claude-opus-4-5-20251101  # LLM model (other options are claude-opus-4-5-20251101, claude-sonnet-4-5-20250929
+model: claude-sonnet-4-5-20250929  # LLM model (other options are claude-opus-4-5-20251101, claude-sonnet-4-5-20250929
 temperature: 1.0
 suffix: Claude  # suffix for generated files (indicates LLM model)
 

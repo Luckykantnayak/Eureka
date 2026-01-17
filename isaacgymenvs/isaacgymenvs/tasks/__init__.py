@@ -29,6 +29,7 @@
 from .ant import Ant
 from .anymal import Anymal
 from .go2w import Go2w
+from .go2 import Go2
 from .anymal_terrain import AnymalTerrain
 from .ball_balance import BallBalance
 from .cartpole import Cartpole 
@@ -79,6 +80,7 @@ isaacgym_task_map = {
     "Ant": Ant,
     "Anymal": Anymal,
     "Go2w" : Go2w,
+    "Go2" : Go2,
     "AnymalTerrain": AnymalTerrain,
     "BallBalance": BallBalance,
     "Cartpole": Cartpole,
