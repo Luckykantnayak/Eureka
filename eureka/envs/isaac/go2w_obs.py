@@ -49,8 +49,10 @@ def compute_go2w_observations(root_states,
     
     commands_scaled = commands*torch.tensor([lin_vel_scale, lin_vel_scale, ang_vel_scale], requires_grad=False, device=commands.device)
     
+    # Leg actions as dof position error from default position
     leg_actions = actions[:, leg_dof_indices]
     
+    # Wheel actions as dof torque
     wheel_actions = actions[:, wheel_dof_indices]
 
     obs = torch.cat((base_lin_vel,

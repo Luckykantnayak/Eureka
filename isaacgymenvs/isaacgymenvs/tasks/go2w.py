@@ -84,7 +84,7 @@ class Go2w(VecTask):
         # default joint positions
         self.named_default_joint_angles = self.cfg["env"]["defaultJointAngles"]
 
-        self.cfg["env"]["numObservations"] = 60
+        self.cfg["env"]["numObservations"] = 56
         self.cfg["env"]["numActions"] = 16
 
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless, virtual_screen_capture=virtual_screen_capture, force_render=force_render)
@@ -130,8 +130,10 @@ class Go2w(VecTask):
         self.commands_x = self.commands.view(self.num_envs, 3)[..., 0]
         self.commands_yaw = self.commands.view(self.num_envs, 3)[..., 2]
         self.default_dof_pos = torch.zeros_like(self.dof_pos, dtype=torch.float, device=self.device, requires_grad=False)
-        self.wheel_indices = [3, 7, 11, 15]
-
+        
+        self.leg_dof_indices = torch.tensor([0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14],device=self.device,dtype=torch.long)
+        self.wheel_dof_indices = torch.tensor([3, 7, 11, 15],device=self.device,dtype=torch.long)
+        
         for i in range(self.cfg["env"]["numActions"]):
             name = self.dof_names[i]
             angle = self.named_default_joint_angles[name]
@@ -207,10 +209,17 @@ class Go2w(VecTask):
                                 device=self.device
                             ).unsqueeze(0)  # shape [1, num_dof]
         
-        for i in range(self.num_dof):
-            dof_props['driveMode'][i] = gymapi.DOF_MODE_EFFORT
-            dof_props['stiffness'][i] = self.cfg["env"]["control"]["stiffness"] #self.Kp
-            dof_props['damping'][i] = self.cfg["env"]["control"]["damping"] #self.Kd
+        for i in range(len(self.dof_names)):
+            name = self.dof_names[i]
+
+            if "wheel" in name:
+                dof_props["driveMode"][i] = gymapi.DOF_MODE_EFFORT
+                dof_props["stiffness"][i] = 0.0
+                dof_props["damping"][i] = 0.0
+            else:
+                dof_props['driveMode'][i] = gymapi.DOF_MODE_POS
+                dof_props['stiffness'][i] = self.cfg["env"]["control"]["stiffness"] #self.Kp
+                dof_props['damping'][i] = self.cfg["env"]["control"]["damping"] #self.Kd
 
 
 
@@ -238,20 +247,57 @@ class Go2w(VecTask):
     def pre_physics_step(self, actions):
         self.actions = actions.to(self.device)
 
-        # Scale normalized actions to torque limits
-        torques = self.actions * self.torque_limits
+        # -------------------------
+        # Split actions
+        # -------------------------
+        leg_actions = self.actions[:, self.leg_dof_indices] 
+        wheel_actions = self.actions[:, self.wheel_dof_indices] 
 
-        # (Optional) safety clamp
-        torques = torch.clamp(
-            torques,
-            -self.torque_limits,
-            self.torque_limits
+
+        # -------------------------
+        # LEG POSITION CONTROL
+        # -------------------------
+        # Target = nominal + delta
+        leg_targets = (
+            self.default_dof_pos[:, self.leg_dof_indices]
+            + leg_actions * self.action_scale
         )
+
+        # Full DOF position target tensor
+        dof_pos_targets = torch.zeros(
+            (self.num_envs, 16),
+            device=self.device
+        )
+        dof_pos_targets[:, self.leg_dof_indices] = leg_targets
+
+        self.gym.set_dof_position_target_tensor(
+            self.sim,
+            gymtorch.unwrap_tensor(dof_pos_targets)
+        )
+
+        # -------------------------
+        # WHEEL TORQUE CONTROL
+        # -------------------------
+        wheel_torques = wheel_actions * self.torque_limits[:, self.wheel_dof_indices]
+        # Safety clamp
+        wheel_torques = torch.clamp(
+            wheel_torques,
+            -self.torque_limits[:, self.wheel_dof_indices],
+            self.torque_limits[:, self.wheel_dof_indices]
+        )
+        # Full DOF torque tensor
+        dof_torques = torch.zeros(
+            (self.num_envs, 16),
+            device=self.device
+        )
+        dof_torques[:, self.wheel_dof_indices] = wheel_torques
 
         self.gym.set_dof_actuation_force_tensor(
             self.sim,
-            gymtorch.unwrap_tensor(torques)
+            gymtorch.unwrap_tensor(dof_torques)
         )
+
+    
 
 
     def post_physics_step(self):
@@ -301,7 +347,9 @@ class Go2w(VecTask):
                                                         self.lin_vel_scale,
                                                         self.ang_vel_scale,
                                                         self.dof_pos_scale,
-                                                        self.dof_vel_scale
+                                                        self.dof_vel_scale,
+                                                        self.leg_dof_indices,
+                                                        self.wheel_dof_indices
         )
 
     def reset_idx(self, env_ids):
@@ -343,31 +391,36 @@ def compute_go2w_observations(root_states,
                                 lin_vel_scale,
                                 ang_vel_scale,
                                 dof_pos_scale,
-                                dof_vel_scale
+                                dof_vel_scale,
+                                leg_dof_indices,
+                                wheel_dof_indices
                                 ):
 
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, float, float, float) -> Tensor
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, float, float, float, Tensor, Tensor) -> Tensor
     base_quat = root_states[:, 3:7]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10]) * lin_vel_scale
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13]) * ang_vel_scale
     projected_gravity = quat_rotate(base_quat, gravity_vec)
-    dof_pos_scaled = (dof_pos - default_dof_pos) * dof_pos_scale
-    indices = torch.tensor(
-        [3, 7, 11, 15],
-        device=dof_pos_scaled.device,
-        dtype=torch.long
-    )
-
-    dof_pos_scaled.index_fill_(1, indices, 0.0)
+    leg_dof_pos_scaled = (dof_pos[:, leg_dof_indices] - default_dof_pos[:, leg_dof_indices]) * dof_pos_scale
+    leg_dof_vel_scaled = dof_vel[:, leg_dof_indices] * dof_vel_scale
+    
+    wheel_dof_vel_scaled = dof_vel[:, wheel_dof_indices] * dof_vel_scale
+    
     commands_scaled = commands*torch.tensor([lin_vel_scale, lin_vel_scale, ang_vel_scale], requires_grad=False, device=commands.device)
+    
+    leg_actions = actions[:, leg_dof_indices]
+    
+    wheel_actions = actions[:, wheel_dof_indices]
 
     obs = torch.cat((base_lin_vel,
                      base_ang_vel,
                      projected_gravity,
                      commands_scaled,
-                     dof_pos_scaled,
-                     dof_vel*dof_vel_scale,
-                     actions
+                     leg_dof_pos_scaled,
+                     leg_dof_vel_scaled,
+                     wheel_dof_vel_scaled,
+                     leg_actions,
+                     wheel_actions
                      ), dim=-1)
 
     return obs

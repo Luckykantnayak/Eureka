@@ -18,28 +18,34 @@ class Go2w(VecTask):
 
         self.cfg = cfg
         
+        # normalization
         self.lin_vel_scale = self.cfg["env"]["learn"]["linearVelocityScale"]
         self.ang_vel_scale = self.cfg["env"]["learn"]["angularVelocityScale"]
         self.dof_pos_scale = self.cfg["env"]["learn"]["dofPositionScale"]
         self.dof_vel_scale = self.cfg["env"]["learn"]["dofVelocityScale"]
         self.action_scale = self.cfg["env"]["control"]["actionScale"]
 
+        # reward scales
         self.rew_scales = {}
         self.rew_scales["lin_vel_xy"] = self.cfg["env"]["learn"]["linearVelocityXYRewardScale"]
         self.rew_scales["ang_vel_z"] = self.cfg["env"]["learn"]["angularVelocityZRewardScale"]
         self.rew_scales["torque"] = self.cfg["env"]["learn"]["torqueRewardScale"]
 
+        # randomization
         self.randomization_params = self.cfg["task"]["randomization_params"]
         self.randomize = self.cfg["task"]["randomize"]
 
+        # command ranges
         self.command_x_range = self.cfg["env"]["randomCommandVelocityRanges"]["linear_x"]
         self.command_y_range = self.cfg["env"]["randomCommandVelocityRanges"]["linear_y"]
         self.command_yaw_range = self.cfg["env"]["randomCommandVelocityRanges"]["yaw"]
 
+        # plane params
         self.plane_static_friction = self.cfg["env"]["plane"]["staticFriction"]
         self.plane_dynamic_friction = self.cfg["env"]["plane"]["dynamicFriction"]
         self.plane_restitution = self.cfg["env"]["plane"]["restitution"]
 
+        # base init state
         pos = self.cfg["env"]["baseInitState"]["pos"]
         rot = self.cfg["env"]["baseInitState"]["rot"]
         v_lin = self.cfg["env"]["baseInitState"]["vLinear"]
@@ -48,6 +54,7 @@ class Go2w(VecTask):
 
         self.base_init_state = state
 
+        # default joint positions
         self.named_default_joint_angles = self.cfg["env"]["defaultJointAngles"]
 
         self.cfg["env"]["numObservations"] = 56
@@ -55,6 +62,7 @@ class Go2w(VecTask):
 
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless, virtual_screen_capture=virtual_screen_capture, force_render=force_render)
 
+        # other
         self.dt = self.sim_params.dt
         self.max_episode_length_s = self.cfg["env"]["learn"]["episodeLength_s"]
         self.max_episode_length = int(self.max_episode_length_s / self.dt + 0.5)
@@ -71,6 +79,7 @@ class Go2w(VecTask):
             cam_target = gymapi.Vec3(lookat[0], lookat[1], lookat[2])
             self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
 
+        # get gym state tensors
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
         net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
@@ -81,6 +90,7 @@ class Go2w(VecTask):
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_dof_force_tensor(self.sim)
 
+        # create some wrapper tensors for different slices
         self.root_states = gymtorch.wrap_tensor(actor_root_state)
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
@@ -102,6 +112,7 @@ class Go2w(VecTask):
             angle = self.named_default_joint_angles[name]
             self.default_dof_pos[:, i] = angle
 
+        # initialize some data used later on
         self.extras = {}
         self.initial_root_states = self.root_states.clone()
         self.initial_root_states[:] = to_torch(self.base_init_state, device=self.device, requires_grad=False)
@@ -117,6 +128,7 @@ class Go2w(VecTask):
         self._create_ground_plane()
         self._create_envs(self.num_envs, self.cfg["env"]['envSpacing'], int(np.sqrt(self.num_envs)))
 
+        # If randomizing, apply once immediately on startup before the fist sim step
         if self.randomize:
             self.apply_randomizations(self.randomization_params)
 
@@ -131,6 +143,7 @@ class Go2w(VecTask):
     def _create_envs(self, num_envs, spacing, num_per_row):
         asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../assets')
         asset_file = "urdf/go2w/urdf/go2w.urdf"
+        
 
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_EFFORT
@@ -167,10 +180,18 @@ class Go2w(VecTask):
                                 device=self.device
                             ).unsqueeze(0)  # shape [1, num_dof]
         
-        for i in range(self.num_dof):
-            dof_props['driveMode'][i] = gymapi.DOF_MODE_EFFORT
-            dof_props['stiffness'][i] = self.cfg["env"]["control"]["stiffness"] #self.Kp
-            dof_props['damping'][i] = self.cfg["env"]["control"]["damping"] #self.Kd
+        for i in range(len(self.dof_names)):
+            name = self.dof_names[i]
+
+            if "wheel" in name:
+                dof_props["driveMode"][i] = gymapi.DOF_MODE_EFFORT
+                dof_props["stiffness"][i] = 0.0
+                dof_props["damping"][i] = 0.0
+            else:
+                dof_props['driveMode'][i] = gymapi.DOF_MODE_POS
+                dof_props['stiffness'][i] = self.cfg["env"]["control"]["stiffness"] #self.Kp
+                dof_props['damping'][i] = self.cfg["env"]["control"]["damping"] #self.Kd
+
 
 
         env_lower = gymapi.Vec3(-spacing, -spacing, 0.0)
@@ -179,6 +200,7 @@ class Go2w(VecTask):
         self.envs = []
 
         for i in range(self.num_envs):
+            # create env instance
             env_ptr = self.gym.create_env(self.sim, env_lower, env_upper, num_per_row)
             go2w_handle = self.gym.create_actor(env_ptr, go2w_asset, start_pose, "go2w", i, 1, 0)
             self.gym.set_actor_dof_properties(env_ptr, go2w_handle, dof_props)
@@ -196,19 +218,54 @@ class Go2w(VecTask):
     def pre_physics_step(self, actions):
         self.actions = actions.to(self.device)
 
-        # Scale normalized actions to torque limits
-        torques = self.actions * self.torque_limits
+        # -------------------------
+        # Split actions
+        # -------------------------
+        leg_actions = self.actions[:, self.leg_dof_indices] 
+        wheel_actions = self.actions[:, self.wheel_dof_indices] 
 
-        # (Optional) safety clamp
-        torques = torch.clamp(
-            torques,
-            -self.torque_limits,
-            self.torque_limits
+
+        # -------------------------
+        # LEG POSITION CONTROL
+        # -------------------------
+        # Target = nominal + delta
+        leg_targets = (
+            self.default_dof_pos[:, self.leg_dof_indices]
+            + leg_actions * self.action_scale
         )
+
+        # Full DOF position target tensor
+        dof_pos_targets = torch.zeros(
+            (self.num_envs, 16),
+            device=self.device
+        )
+        dof_pos_targets[:, self.leg_dof_indices] = leg_targets
+
+        self.gym.set_dof_position_target_tensor(
+            self.sim,
+            gymtorch.unwrap_tensor(dof_pos_targets)
+        )
+
+        # -------------------------
+        # WHEEL TORQUE CONTROL
+        # -------------------------
+        wheel_torques = wheel_actions * self.torque_limits[:, self.wheel_dof_indices]
+        # Safety clamp
+        wheel_torques = torch.clamp(
+            wheel_torques,
+            -self.torque_limits[:, self.wheel_dof_indices],
+            self.torque_limits[:, self.wheel_dof_indices]
+        )
+        # Full DOF torque tensor
+        dof_torques = torch.zeros(
+            (self.num_envs, 16),
+            device=self.device
+        )
+        dof_torques[:, self.wheel_dof_indices] = wheel_torques
 
         self.gym.set_dof_actuation_force_tensor(
             self.sim,
-            gymtorch.unwrap_tensor(torques)
+            gymtorch.unwrap_tensor(dof_torques)
         )
 
     def post_physics_step(self):
@@ -251,6 +308,7 @@ class Go2w(VecTask):
                                                         self.dof_vel,
                                                         self.gravity_vec,
                                                         self.actions,
+                                                        # scales
                                                         self.lin_vel_scale,
                                                         self.ang_vel_scale,
                                                         self.dof_pos_scale,

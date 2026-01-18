@@ -1,4 +1,4 @@
-task: Go2w
-env_name: go2w
+task: Go2
+env_name: go2
 description: to make the quadruped follow randomly chosen x,y, and yaw target velocities
 max_iterations: 1000
