@@ -181,16 +181,9 @@ class Go2w(VecTask):
                             ).unsqueeze(0)  # shape [1, num_dof]
         
         for i in range(len(self.dof_names)):
-            name = self.dof_names[i]
-
-            if "wheel" in name:
-                dof_props["driveMode"][i] = gymapi.DOF_MODE_EFFORT
-                dof_props["stiffness"][i] = 0.0
-                dof_props["damping"][i] = 0.0
-            else:
-                dof_props['driveMode'][i] = gymapi.DOF_MODE_POS
-                dof_props['stiffness'][i] = self.cfg["env"]["control"]["stiffness"] #self.Kp
-                dof_props['damping'][i] = self.cfg["env"]["control"]["damping"] #self.Kd
+            dof_props["driveMode"][i] = gymapi.DOF_MODE_EFFORT
+            dof_props['stiffness'][i] = self.cfg["env"]["control"]["stiffness"] #self.Kp
+            dof_props['damping'][i] = self.cfg["env"]["control"]["damping"] #self.Kd
 
 
 
@@ -217,52 +210,32 @@ class Go2w(VecTask):
 
     def pre_physics_step(self, actions):
         self.actions = actions.to(self.device)
-
-        # -------------------------
-        # Split actions
-        # -------------------------
-        leg_actions = self.actions[:, self.leg_dof_indices] 
-        wheel_actions = self.actions[:, self.wheel_dof_indices] 
-
-
         # -------------------------
         # LEG POSITION CONTROL
         # -------------------------
-        # Target = nominal + delta
-        leg_targets = (
-            self.default_dof_pos[:, self.leg_dof_indices]
-            + leg_actions * self.action_scale
-        )
-
-        # Full DOF position target tensor
-        dof_pos_targets = torch.zeros(
-            (self.num_envs, 16),
-            device=self.device
-        )
-        dof_pos_targets[:, self.leg_dof_indices] = leg_targets
-
-        self.gym.set_dof_position_target_tensor(
-            self.sim,
-            gymtorch.unwrap_tensor(dof_pos_targets)
-        )
+        dof_error = self.default_dof_pos[:, self.leg_dof_indices] - self.dof_pos[:, self.leg_dof_indices]
+        leg_torques = self.Kp * (dof_error + actions[:, self.leg_dof_indices] * self.action_scale) - self.Kd * self.dof_vel[:, self.leg_dof_indices]
 
         # -------------------------
         # WHEEL TORQUE CONTROL
         # -------------------------
-        wheel_torques = wheel_actions * self.torque_limits[:, self.wheel_dof_indices]
-        # Safety clamp
-        wheel_torques = torch.clamp(
-            wheel_torques,
-            -self.torque_limits[:, self.wheel_dof_indices],
-            self.torque_limits[:, self.wheel_dof_indices]
-        )
+        wheel_torques = self.actions[:, self.wheel_dof_indices] * self.torque_limits[:, self.wheel_dof_indices]
+        
         # Full DOF torque tensor
         dof_torques = torch.zeros(
             (self.num_envs, 16),
             device=self.device
         )
-        dof_torques[:, self.wheel_dof_indices] = wheel_torques
 
+        dof_torques[:, self.leg_dof_indices] = leg_torques
+        dof_torques[:, self.wheel_dof_indices] = wheel_torques
+        
+        # Safety clamp
+        dof_torques = torch.clamp(
+            dof_torques,
+            -self.torque_limits,
+            self.torque_limits
+        )
         self.gym.set_dof_actuation_force_tensor(
             self.sim,
             gymtorch.unwrap_tensor(dof_torques)
