@@ -284,7 +284,7 @@ class Go2w(VecTask):
             self.commands,
             self.torques,
             self.contact_forces,
-            self.knee_indices,
+            self.feet_indices,
             self.consecutive_successes,
             self.progress_buf,
             self.rew_scales,

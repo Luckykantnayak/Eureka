@@ -1,30 +1,3 @@
-# Copyright (c) 2018-2023, NVIDIA Corporation
-# All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice, this
-#    list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-#    this list of conditions and the following disclaimer in the documentation
-#    and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-#    contributors may be used to endorse or promote products derived from
-#    this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
 import os
@@ -39,7 +12,7 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 from typing import Tuple, Dict
 
 
-class Go2w(VecTask):
+class Go2wAerialcrossoverClaude(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
 
@@ -170,13 +143,11 @@ class Go2w(VecTask):
     def _create_envs(self, num_envs, spacing, num_per_row):
         asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../assets')
         asset_file = "urdf/go2w/urdf/go2w.urdf"
-        #asset_path = os.path.join(asset_root, asset_file)
-        #asset_root = os.path.dirname(asset_path)
-        #asset_file = os.path.basename(asset_path)
+        
 
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_EFFORT
-        asset_options.collapse_fixed_joints = True
+        asset_options.collapse_fixed_joints = False
         asset_options.replace_cylinder_with_capsule = True
         asset_options.flip_visual_attachments = True
         asset_options.fix_base_link = self.cfg["env"]["urdfAsset"]["fixBaseLink"]
@@ -297,9 +268,6 @@ class Go2w(VecTask):
             gymtorch.unwrap_tensor(dof_torques)
         )
 
-    
-
-
     def post_physics_step(self):
         self.progress_buf += 1
 
@@ -311,8 +279,10 @@ class Go2w(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.reset_buf[:], self.consecutive_successes[:] = compute_go2w_reward(
-            # tensors
+        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_pos, self.default_dof_pos, self.dof_vel, self.actions, self.contact_forces, self.leg_dof_indices, self.wheel_dof_indices, self.gravity_vec)
+        self.extras['gpt_reward'] = self.rew_buf.mean()
+        for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
+        self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
             self.root_states,
             self.commands,
             self.torques,
@@ -320,13 +290,11 @@ class Go2w(VecTask):
             self.feet_indices,
             self.consecutive_successes,
             self.progress_buf,
-            # Dict
             self.rew_scales,
-            # other
             self.base_index,
             self.max_episode_length,
         )
-
+        self.extras['gt_reward'] = self.gt_rew_buf.mean()
         self.extras['consecutive_successes'] = self.consecutive_successes.mean() 
 
     def compute_observations(self):
@@ -353,7 +321,6 @@ class Go2w(VecTask):
         )
 
     def reset_idx(self, env_ids):
-        # Randomization can happen only at reset time, since it can reset actor positions on GPU
         if self.randomize:
             self.apply_randomizations(self.randomization_params)
 
@@ -425,14 +392,39 @@ def compute_go2w_observations(root_states,
 
     return obs
 
-#####################################################################
-###=========================jit functions=========================###
-#####################################################################
+def quat_to_rpy(q):
+    """
+    Convert quaternion to roll, pitch, yaw.
+    
+    Args:
+        q: Tensor of shape (N, 4) in (x, y, z, w) format
+    
+    Returns:
+        roll, pitch, yaw: each of shape (N,)
+    """
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+
+    # Roll (x-axis rotation)
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(sinr, cosr)
+
+    # Pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = torch.clamp(sinp, -1.0, 1.0)  # numerical safety
+    pitch = torch.asin(sinp)
+
+    # Yaw (z-axis rotation)
+    siny = 2.0 * (w * z + x * y)
+    cosy = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny, cosy)
+
+    return roll, pitch, yaw
 
 
 @torch.jit.script
-def compute_go2w_reward(
-    # tensors
+#### Aerial crossover Task Success Function ####
+def compute_success(
     root_states,
     commands,
     torques,
@@ -440,38 +432,267 @@ def compute_go2w_reward(
     feet_indices,
     consecutive_successes,
     episode_lengths,
-    # Dict
     rew_scales,
-    # other
     base_index,
     max_episode_length
 ):
-    # (reward, reset, feet_in air, feet_air_time, episode sums)
     # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
 
-    # prepare quantities (TODO: return from obs ?)
+    # --- Base kinematics ---
+    base_quat = root_states[:, 3:7]
+    base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
+
+    # --- Forward velocity tracking (vx > 0 only) ---
+    vx_cmd = torch.clamp(commands[:, 0], min=0.0)
+    vx_error = torch.square(vx_cmd - base_lin_vel[:, 0])
+    rew_vx = torch.exp(-vx_error / 0.25) * rew_scales["lin_vel_xy"]
+
+    # --- Contact logic ---
+    # feet_indices assumed ordered: [FL, FR, RL, RR]
+    foot_forces = torch.norm(contact_forces[:, feet_indices, :], dim=2)
+    foot_contact = foot_forces > 1.0  # contact threshold
+
+    # Diagonal pairs
+    diag_1 = foot_contact[:, 0] & foot_contact[:, 3]  # FL + RR
+    diag_2 = foot_contact[:, 1] & foot_contact[:, 2]  # FR + RL
+
+    # Alternating diagonal lift (XOR)
+    diagonal_wave = (diag_1 ^ diag_2).float()
+    rew_diagonal_wave = diagonal_wave * rew_scales.get("diagonal_wave", 1.0)
+
+    # --- Penalize full aerial or full stance ---
+    all_contact = torch.all(foot_contact, dim=1)
+    no_contact = torch.all(~foot_contact, dim=1)
+    rew_contact_balance = (~all_contact & ~no_contact).float() * rew_scales.get("contact_balance", 1.0)
+
+    # --- Torque regularization ---
+    rew_torque = torch.sum(torch.square(torques), dim=1) * rew_scales["torque"]
+
+    # --- Total reward ---
+    total_reward = (
+        rew_vx
+        + rew_diagonal_wave
+        + rew_contact_balance
+        + rew_torque
+    )
+    total_reward = torch.clip(total_reward, 0.0, None)
+
+    # --- Reset conditions ---
+    base_contact = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.0
+    time_out = episode_lengths >= max_episode_length - 1
+    reset = base_contact | time_out
+
+    # --- Success metric (for logging / curriculum) ---
+    consecutive_successes = (
+        rew_vx.mean()
+        + rew_diagonal_wave.mean()
+    )
+
+    return total_reward.detach(), reset, consecutive_successes
+
+
+from typing import Tuple, Dict
+import math
+import torch
+from torch import Tensor
+@torch.jit.script
+def compute_reward(
+    root_states: torch.Tensor,
+    commands: torch.Tensor,
+    dof_pos: torch.Tensor,
+    default_dof_pos: torch.Tensor,
+    dof_vel: torch.Tensor,
+    actions: torch.Tensor,
+    contact_forces: torch.Tensor,
+    leg_dof_indices: torch.Tensor,
+    wheel_dof_indices: torch.Tensor,
+    gravity_vec: torch.Tensor
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    
+    # Extract commanded velocities
+    cmd_vx = commands[:, 0]
+    cmd_vy = commands[:, 1]
+    cmd_yaw = commands[:, 2]
+    
+    # Extract base states
     base_quat = root_states[:, 3:7]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13])
-
-    # velocity tracking reward
-    lin_vel_error = torch.sum(torch.square(commands[:, :2] - base_lin_vel[:, :2]), dim=1)
-    ang_vel_error = torch.square(commands[:, 2] - base_ang_vel[:, 2])
-    rew_lin_vel_xy = torch.exp(-lin_vel_error/0.25) * rew_scales["lin_vel_xy"]
-    rew_ang_vel_z = torch.exp(-ang_vel_error/0.25) * rew_scales["ang_vel_z"]
-
-    # torque penalty
-    rew_torque = torch.sum(torch.square(torques), dim=1) * rew_scales["torque"]
-
-    total_reward = rew_lin_vel_xy + rew_ang_vel_z + rew_torque
-    total_reward = torch.clip(total_reward, 0., None)
-    # reset agents
-    reset = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.
-    reset = reset | torch.any(torch.norm(contact_forces[:, feet_indices, :], dim=2) > 1., dim=1)
-    time_out = episode_lengths >= max_episode_length - 1  # no terminal reward for time-outs
-    reset = reset | time_out
+    base_height = root_states[:, 2]
     
-    consecutive_successes = -(lin_vel_error + ang_vel_error).mean()
-
-    # total_reward = -(lin_vel_error + ang_vel_error)
-    return total_reward.detach(), reset, consecutive_successes
+    # Projected gravity for orientation tracking
+    projected_gravity = quat_rotate(base_quat, gravity_vec)
+    
+    # Get leg and wheel velocities
+    leg_dof_vel = dof_vel[:, leg_dof_indices]
+    wheel_dof_vel = dof_vel[:, wheel_dof_indices]
+    leg_dof_pos = dof_pos[:, leg_dof_indices]
+    
+    # Determine mode based on commanded forward velocity
+    forward_mode = cmd_vx > 0.1
+    stationary_mode = ~forward_mode
+    
+    # ===== Forward Mode Rewards (vx > 0.1) =====
+    
+    # 1. Forward velocity tracking - use quadratic error with high temperature
+    forward_vel_temp: float = 6.0
+    forward_vel_error = torch.square(base_lin_vel[:, 0] - cmd_vx)
+    forward_vel_reward = torch.exp(-forward_vel_error / forward_vel_temp)
+    
+    # 2. Lateral velocity tracking
+    lateral_vel_temp: float = 0.5
+    lateral_vel_error = torch.abs(base_lin_vel[:, 1] - cmd_vy)
+    lateral_vel_reward = torch.exp(-lateral_vel_error / lateral_vel_temp)
+    
+    # 3. Yaw velocity tracking
+    yaw_vel_temp: float = 0.5
+    yaw_vel_error = torch.abs(base_ang_vel[:, 2] - cmd_yaw)
+    yaw_vel_reward = torch.exp(-yaw_vel_error / yaw_vel_temp)
+    
+    # 4. Wheel velocity - adaptive to commanded velocity
+    wheel_vel_temp: float = 3.0
+    target_wheel_vel = torch.clamp(cmd_vx * 2.5, min=2.0, max=10.0)
+    wheel_vel_magnitude = torch.abs(wheel_dof_vel).mean(dim=-1)
+    wheel_spinning_error = torch.abs(wheel_vel_magnitude - target_wheel_vel)
+    wheel_spinning_reward = torch.exp(-wheel_spinning_error / wheel_vel_temp)
+    
+    # 5. REVISED: Leg motion reward - simple total velocity magnitude
+    leg_motion_temp: float = 2.5
+    leg_vel_magnitude = torch.sum(torch.abs(leg_dof_vel), dim=-1)
+    # Target around 15-20 rad/s total across all leg joints
+    target_leg_vel: float = 18.0
+    leg_motion_error = torch.abs(leg_vel_magnitude - target_leg_vel)
+    leg_motion_reward = torch.exp(-leg_motion_error / leg_motion_temp)
+    
+    # 6. Diagonal leg coordination
+    diagonal_coord_temp: float = 2.0
+    if leg_dof_indices.shape[0] >= 12:
+        fl_vel = leg_dof_vel[:, 0]
+        fr_vel = leg_dof_vel[:, 3]
+        rl_vel = leg_dof_vel[:, 6]
+        rr_vel = leg_dof_vel[:, 9]
+        
+        diag1_sync = torch.abs(fl_vel - rr_vel)
+        diag2_sync = torch.abs(fr_vel - rl_vel)
+        diagonal_coord_error = (diag1_sync + diag2_sync) / 2.0
+        diagonal_coord_reward = torch.exp(-diagonal_coord_error / diagonal_coord_temp)
+    else:
+        diagonal_coord_reward = torch.zeros_like(cmd_vx)
+    
+    # 7. Upright orientation - RELAXED temperature for more tolerance
+    upright_temp: float = 0.8
+    upright_error = torch.sum(torch.square(projected_gravity[:, :2]), dim=-1)
+    upright_reward = torch.exp(-upright_error / upright_temp)
+    
+    # 8. Base height maintenance for forward motion
+    height_temp: float = 0.25
+    target_height: float = 0.28
+    height_error = torch.abs(base_height - target_height)
+    height_reward = torch.exp(-height_error / height_temp)
+    
+    # 9. Action rate penalty
+    action_rate_temp: float = 50.0
+    action_rate = torch.sum(torch.square(actions), dim=-1)
+    action_smoothness = torch.exp(-action_rate / action_rate_temp)
+    
+    # 10. Wheel ground contact
+    wheel_contact_temp: float = 30.0
+    wheel_contact_forces = contact_forces[:, wheel_dof_indices, 2]  # z-component
+    wheel_contact_magnitude = torch.sum(torch.abs(wheel_contact_forces), dim=-1)
+    wheel_contact_reward = 1.0 - torch.exp(-wheel_contact_magnitude / wheel_contact_temp)
+    
+    # 11. Leg clearance reward - REDUCED temperature for better gradient
+    leg_clearance_temp: float = 0.08
+    leg_pos_deviation = torch.sum(torch.square(leg_dof_pos - default_dof_pos[:, leg_dof_indices]), dim=-1)
+    leg_clearance_reward = 1.0 - torch.exp(-leg_pos_deviation / leg_clearance_temp)
+    
+    # ===== Stationary Mode Rewards (vx <= 0.1) =====
+    
+    # 1. Zero linear velocity
+    stationary_lin_vel_temp: float = 0.3
+    stationary_lin_vel_penalty = torch.sum(torch.square(base_lin_vel), dim=-1)
+    stationary_lin_vel_reward = torch.exp(-stationary_lin_vel_penalty / stationary_lin_vel_temp)
+    
+    # 2. Zero angular velocity - slightly increased temperature
+    stationary_ang_vel_temp: float = 2.0
+    stationary_ang_vel_penalty = torch.sum(torch.square(base_ang_vel), dim=-1)
+    stationary_ang_vel_reward = torch.exp(-stationary_ang_vel_penalty / stationary_ang_vel_temp)
+    
+    # 3. Seated posture - try higher temperature for easier learning
+    seated_posture_temp: float = 5.0
+    seated_pos_error = torch.sum(torch.square(leg_dof_pos - default_dof_pos[:, leg_dof_indices]), dim=-1)
+    seated_posture_reward = torch.exp(-seated_pos_error / seated_posture_temp)
+    
+    # 4. Wheel stationary - SIGNIFICANTLY increased temperature
+    wheel_stationary_temp: float = 120.0
+    wheel_vel_penalty = torch.sum(torch.square(wheel_dof_vel), dim=-1)
+    wheel_stationary_reward = torch.exp(-wheel_vel_penalty / wheel_stationary_temp)
+    
+    # 5. Leg stability - increased temperature
+    leg_stability_temp: float = 35.0
+    leg_vel_penalty = torch.sum(torch.square(leg_dof_vel), dim=-1)
+    leg_stability_reward = torch.exp(-leg_vel_penalty / leg_stability_temp)
+    
+    # 6. Low base height for seated posture
+    seated_height_temp: float = 0.18
+    seated_target_height: float = 0.18
+    seated_height_error = torch.abs(base_height - seated_target_height)
+    seated_height_reward = torch.exp(-seated_height_error / seated_height_temp)
+    
+    # 7. Upright even in stationary mode
+    stationary_upright_reward = upright_reward
+    
+    # ===== Combine Rewards Based on Mode =====
+    
+    # Forward mode: MAXIMUM priority on forward velocity
+    forward_mode_reward = (
+        15.0 * forward_vel_reward +           # INCREASED from 12.0 - absolute priority
+        2.0 * lateral_vel_reward +
+        2.0 * yaw_vel_reward +
+        2.5 * wheel_spinning_reward +
+        2.5 * leg_motion_reward +             # Increased slightly
+        1.5 * diagonal_coord_reward +
+        4.0 * upright_reward +                # Increased from 3.0 - critical for stability
+        1.5 * height_reward +
+        4.0 * wheel_contact_reward +
+        1.5 * leg_clearance_reward +          # Increased from 1.0
+        0.5 * action_smoothness
+    )
+    
+    # Stationary mode: balanced priorities
+    stationary_mode_reward = (
+        6.0 * stationary_lin_vel_reward +
+        5.0 * stationary_ang_vel_reward +
+        5.0 * seated_posture_reward +         # Increased from 4.0
+        7.0 * wheel_stationary_reward +       # Increased from 6.0
+        4.0 * leg_stability_reward +          # Increased from 3.0
+        3.0 * seated_height_reward +
+        2.0 * stationary_upright_reward
+    )
+    
+    # Select reward based on mode
+    total_reward = torch.where(forward_mode, forward_mode_reward, stationary_mode_reward)
+    
+    # Create reward dictionary
+    reward_components = {
+        "forward_vel_reward": forward_vel_reward,
+        "lateral_vel_reward": lateral_vel_reward,
+        "yaw_vel_reward": yaw_vel_reward,
+        "wheel_spinning_reward": wheel_spinning_reward,
+        "leg_motion_reward": leg_motion_reward,
+        "diagonal_coord_reward": diagonal_coord_reward,
+        "upright_reward": upright_reward,
+        "height_reward": height_reward,
+        "action_smoothness": action_smoothness,
+        "wheel_contact_reward": wheel_contact_reward,
+        "leg_clearance_reward": leg_clearance_reward,
+        "stationary_lin_vel_reward": stationary_lin_vel_reward,
+        "stationary_ang_vel_reward": stationary_ang_vel_reward,
+        "seated_posture_reward": seated_posture_reward,
+        "wheel_stationary_reward": wheel_stationary_reward,
+        "leg_stability_reward": leg_stability_reward,
+        "seated_height_reward": seated_height_reward,
+        "total_reward": total_reward
+    }
+    
+    return total_reward, reward_components

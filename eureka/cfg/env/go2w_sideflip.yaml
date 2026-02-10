@@ -1,5 +1,5 @@
-task: Go2w
-env_name: go2w
+task: Go2wSideflip
+env_name: go2w_sideflip
 description: >
   Control the Go2w robot to perform a dynamic side flip conditioned on the commanded forward velocity.
   When the commanded forward velocity vx is strictly positive, the robot should execute a single lateral
@@ -17,4 +17,4 @@ description: >
 
 
 
-max_iterations: 1000
+max_iterations: 3000

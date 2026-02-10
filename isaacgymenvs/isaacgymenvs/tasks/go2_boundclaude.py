@@ -12,7 +12,7 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 from typing import Tuple, Dict
 
 
-class Go2Claude(VecTask):
+class Go2BoundClaude(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
 
@@ -200,7 +200,7 @@ class Go2Claude(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_pos, self.default_dof_pos, self.dof_vel, self.contact_forces, self.actions, self.dt)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.dof_pos, self.dof_vel, self.contact_forces, self.commands, self.actions, self.default_dof_pos, self.gravity_vec)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
@@ -208,7 +208,7 @@ class Go2Claude(VecTask):
             self.commands,
             self.torques,
             self.contact_forces,
-            self.knee_indices,
+            self.feet_indices,
             self.consecutive_successes,
             self.progress_buf,
             self.rew_scales,
@@ -312,10 +312,9 @@ def compute_success(
     episode_lengths,
     rew_scales,
     base_index,
-    max_episode_length,
-    dt=0.02  # timestep
+    max_episode_length
 ):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int, float) -> Tuple[Tensor, Tensor, Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
 
     batch_size = root_states.shape[0]
     device = root_states.device
@@ -326,152 +325,204 @@ def compute_success(
     base_quat = root_states[:, 3:7]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13])
+    base_height = root_states[:, 2]
 
-    lin_vel_error = torch.sum((commands[:, :2] - base_lin_vel[:, :2]) ** 2, dim=1)
-    ang_vel_error = (commands[:, 2] - base_ang_vel[:, 2]) ** 2
+    # Extract commanded velocities
+    cmd_vx = commands[:, 0]  # Forward velocity command
+    cmd_vy = commands[:, 1]  # Lateral velocity command
+    cmd_vyaw = commands[:, 2]  # Yaw rate command
 
-    rew_lin_vel_xy = torch.exp(-lin_vel_error / 0.25) * rew_scales.get("lin_vel_xy", 1.0)
-    rew_ang_vel_z = torch.exp(-ang_vel_error / 0.25) * rew_scales.get("ang_vel_z", 0.5)
+    # Velocity tracking errors
+    vx_error = torch.square(cmd_vx - base_lin_vel[:, 0])
+    vy_error = torch.square(cmd_vy - base_lin_vel[:, 1])
+    vyaw_error = torch.square(cmd_vyaw - base_ang_vel[:, 2])
+
+    # Stronger velocity tracking rewards (exponential)
+    rew_lin_vel_x = torch.exp(-vx_error / 0.25) * rew_scales.get("lin_vel_x", 2.0)
+    rew_lin_vel_y = torch.exp(-vy_error / 0.25) * rew_scales.get("lin_vel_y", 0.5)
+    rew_ang_vel_z = torch.exp(-vyaw_error / 0.25) * rew_scales.get("ang_vel_z", 0.5)
 
     # ----------------------------
     # Contact detection
     # foot order: [FL, FR, RL, RR]
-    # Trot diagonals: (FL + RR) and (FR + RL)
     # ----------------------------
     contact_thresh = 1.0
     foot_forces = torch.norm(contact_forces[:, feet_indices, :], dim=2)
     foot_contact = (foot_forces > contact_thresh).float()
 
-    # Diagonal pairs for trotting
-    diagonal1 = foot_contact[:, 0] * foot_contact[:, 3]  # FL + RR
-    diagonal2 = foot_contact[:, 1] * foot_contact[:, 2]  # FR + RL
+    front_pair = foot_contact[:, 0] * foot_contact[:, 1]  # Both front feet
+    rear_pair = foot_contact[:, 2] * foot_contact[:, 3]   # Both rear feet
     
     # ----------------------------
-    # Trot gait metrics
+    # Bounding gait metrics
     # ----------------------------
     
-    # 1. Diagonal contact (one diagonal pair down, not both)
-    diagonal_contact = (diagonal1 + diagonal2).clamp(0, 1)
-    both_diagonals = diagonal1 * diagonal2  # Bad: all feet down
+    # 1. Paired contact (front OR rear, not both)
+    paired_contact = (front_pair + rear_pair).clamp(0, 1)
+    both_pairs_contact = front_pair * rear_pair  # Bad: all feet down
     
-    # 2. Diagonal alternation (key characteristic of trot)
-    diagonal_alternation = diagonal_contact * (1.0 - both_diagonals)
+    # 2. Phase alternation (front and rear should alternate)
+    phase_alternation = paired_contact * (1.0 - both_pairs_contact)
     
-    # 3. Duty cycle (percentage of time feet are in contact)
-    # Trot typically has 50-60% duty cycle (longer than bounding)
-    total_contact = foot_contact.sum(dim=1)
-    duty_cycle = total_contact / 4.0  # Normalized 0-1
-    # Ideal trot duty cycle around 0.5-0.6 (2 feet down at a time)
-    duty_cycle_score = torch.exp(-((duty_cycle - 0.5) ** 2) / 0.1)
+    # 3. Flight phase detection (no feet in contact)
+    no_contact = (1.0 - foot_contact.sum(dim=1).clamp(0, 1))
     
-    # 4. Prevent wrong pairs (front pair or rear pair together)
-    front_pair = foot_contact[:, 0] * foot_contact[:, 1]
-    rear_pair = foot_contact[:, 2] * foot_contact[:, 3]
-    wrong_pairs = front_pair + rear_pair
-    
-    # 5. Diagonal force symmetry (forces should be balanced in each diagonal)
-    diagonal1_symmetry = 1.0 - torch.abs(foot_forces[:, 0] - foot_forces[:, 3]) / (
-        foot_forces[:, 0] + foot_forces[:, 3] + 1e-6
+    # 4. Symmetry within pairs (left-right force balance)
+    front_symmetry = 1.0 - torch.abs(foot_forces[:, 0] - foot_forces[:, 1]) / (
+        foot_forces[:, 0] + foot_forces[:, 1] + 1e-6
     )
-    diagonal2_symmetry = 1.0 - torch.abs(foot_forces[:, 1] - foot_forces[:, 2]) / (
-        foot_forces[:, 1] + foot_forces[:, 2] + 1e-6
+    rear_symmetry = 1.0 - torch.abs(foot_forces[:, 2] - foot_forces[:, 3]) / (
+        foot_forces[:, 2] + foot_forces[:, 3] + 1e-6
     )
-    diagonal_symmetry = (diagonal1_symmetry + diagonal2_symmetry) * 0.5 * diagonal_contact
+    symmetry = (front_symmetry + rear_symmetry) * 0.5 * paired_contact
     
-    # 6. Stability (body should remain level during trot)
-    # Check roll and pitch angles
+    # 5. IMPROVED: Forward propulsion (strongly reward forward velocity during contact)
+    # This is the key fix - reward actual forward velocity, not just motion detection
+    forward_velocity = base_lin_vel[:, 0]
+    
+    # When commanded to move forward, reward achieving that velocity
+    commanded_to_move = cmd_vx.abs() > 0.1
+    
+    # Reward forward velocity achievement during paired contacts
+    velocity_achievement = torch.exp(-torch.square(forward_velocity - cmd_vx) / 0.5) * paired_contact
+    
+    # Also reward forward velocity during flight (maintains momentum)
+    flight_momentum = (forward_velocity / (cmd_vx.abs() + 1e-6)).clamp(0, 2.0) * no_contact
+    
+    # 6. Height maintenance during bounding
+    target_height = 0.35  # Target CoM height for GO2
+    height_error = torch.square(base_height - target_height)
+    height_reward = torch.exp(-height_error / 0.05)
+    
+    
+    # 8. Orientation stability (minimal roll and yaw)
     up_vec_local = torch.zeros(batch_size, 3, dtype=torch.float, device=device)
     up_vec_local[:, 2] = 1.0
     up_vec = quat_rotate(base_quat, up_vec_local)
     
-    # Body levelness (up vector should point mostly upward)
-    body_level = up_vec[:, 2]  # Closer to 1.0 = more upright
-    stability_score = (body_level > 0.85).float()  # Within ~30 degrees
+    # Forward vector should point forward (minimal yaw deviation)
+    forward_vec_local = torch.zeros(batch_size, 3, dtype=torch.float, device=device)
+    forward_vec_local[:, 0] = 1.0
+    forward_vec = quat_rotate(base_quat, forward_vec_local)
     
-    # 7. Forward motion consistency
-    forward_velocity = base_lin_vel[:, 0]
-    moving_forward = (forward_velocity > 0.1).float()
-    velocity_consistency = moving_forward * diagonal_contact
+    # Reward upright orientation
+    upright_reward = up_vec[:, 2]  # Should be close to 1.0
+    forward_alignment = forward_vec[:, 0]  # Should be close to 1.0
     
-    # 8. Minimal lateral drift (trot should be straight)
-    lateral_drift = torch.abs(base_lin_vel[:, 1])
-    drift_penalty = torch.exp(-lateral_drift / 0.5)
+    orientation_reward = (upright_reward * 0.6 + forward_alignment * 0.4)
     
-    # 9. Height consistency (CoM should stay relatively constant)
-    base_height = root_states[:, 2]
-    # Penalize if too low (crouching) or bouncing too much
-    height_score = torch.exp(-((base_height - 0.35) ** 2) / 0.05)  # Target ~0.35m
-    
-    
+    # 9. Lateral drift penalty (should move straight)
+    lateral_velocity = torch.abs(base_lin_vel[:, 1])
+    lateral_penalty = -lateral_velocity * rew_scales.get("lateral_drift", 0.3)
     
     # ----------------------------
-    # Trot quality score
+    # IMPROVED: Bounding quality score
     # ----------------------------
-    trot_quality = (
-        diagonal_alternation * 0.30 +    # 30%: Correct diagonal contacts
-        duty_cycle_score * 0.15 +         # 15%: Appropriate duty cycle
-        diagonal_symmetry * 0.20 +        # 20%: Diagonal force balance
-        stability_score * 0.15 +          # 15%: Body stability
-        velocity_consistency * 0.10 +     # 10%: Consistent forward motion
-        drift_penalty * 0.10              # 10%: Minimal lateral drift
+    # Reweighted to emphasize velocity tracking and forward propulsion
+    bounding_quality = (
+        phase_alternation * 0.25 +          # 25%: Correct pair contacts
+        no_contact * 0.15 +                  # 15%: Flight phases present
+        symmetry * 0.15 +                    # 15%: Left-right symmetry
+        velocity_achievement * 0.30 +        # 30%: Achieving commanded velocity (NEW - highest weight!)
+        flight_momentum * 0.10 +             # 10%: Maintaining momentum in flight
+        orientation_reward * 0.05            # 5%: Staying upright and forward-facing
     )
     
-    # Penalties for incorrect gait patterns
-    wrong_pair_penalty = wrong_pairs * rew_scales.get("wrong_pair_penalty", -0.3)
-    both_diag_penalty = both_diagonals * rew_scales.get("both_diag_penalty", -0.4)
+    # ----------------------------
+    # Penalties
+    # ----------------------------
     
-    # ----------------------------
-    # Rewards
-    # ----------------------------
-    rew_trot = trot_quality * rew_scales.get("trot", 2.0)
+    # Penalize all-feet-down stance (prevents trotting)
+    stance_penalty = both_pairs_contact * rew_scales.get("stance_penalty", -1.0)
+    
+    # Energy penalties
     rew_torque = -torch.sum(torch.abs(torques), dim=1) * rew_scales.get("torque", 0.0001)
-    rew_height = height_score * rew_scales.get("height", 0.3)
+    rew_torque_rate = -torch.sum(torch.square(torques), dim=1) * rew_scales.get("torque_square", 0.00005)
     
-    # Energy efficiency (smooth, consistent motion)
-    torque_smoothness = -torch.sum(torques ** 2, dim=1) * rew_scales.get("smoothness", 0.0001)
+    # Penalize wrong gait patterns
+    single_foot = (foot_contact.sum(dim=1) == 1.0).float()  # Hopping on one foot
+    three_feet = (foot_contact.sum(dim=1) == 3.0).float()   # Awkward tripod
+    wrong_pattern_penalty = -(single_foot + three_feet) * rew_scales.get("wrong_pattern", 0.5)
     
-    total_reward = (
-        rew_lin_vel_xy + 
-        rew_ang_vel_z + 
-        rew_trot + 
-        rew_torque + 
-        rew_height +
-        torque_smoothness +
-        wrong_pair_penalty +
-        both_diag_penalty
-    )
+    # ----------------------------
+    # IMPROVED: Reward structure
+    # ----------------------------
+    
+    # When commanded to move (|cmd_vx| > 0.1)
+    moving_rewards = (
+        rew_lin_vel_x +              # Track forward velocity (high weight)
+        rew_lin_vel_y +              # Track lateral velocity
+        rew_ang_vel_z +              # Track yaw rate
+        bounding_quality * rew_scales.get("bounding", 3.0) +  # Bounding quality (increased weight)
+        height_reward * rew_scales.get("height", 0.5) +       # Maintain height
+        lateral_penalty +            # Minimize lateral drift
+        stance_penalty +             # Avoid stance phase
+        wrong_pattern_penalty +      # Avoid wrong patterns
+        rew_torque +                 # Energy efficiency
+        rew_torque_rate              # Smooth torques
+    ) * commanded_to_move.float()
+    
+    # When commanded to stay still (|cmd_vx| <= 0.1)
+    still_reward = (
+        (torch.abs(base_lin_vel[:, 0]) < 0.1).float() *
+        (torch.abs(base_lin_vel[:, 1]) < 0.1).float() *
+        (torch.abs(base_ang_vel[:, 2]) < 0.1).float() *
+        foot_contact.sum(dim=1).clamp(min=2.0) / 4.0 *  # At least 2 feet on ground
+        rew_scales.get("idle", 1.0)
+    ) * (~commanded_to_move).float()
+    
+    total_reward = moving_rewards + still_reward
+    total_reward = torch.clamp(total_reward, min=-10.0, max=10.0)
     
     # ----------------------------
     # Reset conditions
     # ----------------------------
     base_contact = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.0
     
-    # Robot tilted too much (more lenient than bounding)
-    tilted = up_vec[:, 2] < 0.3  # ~72 degrees (trot is more stable)
+    # Robot tilted too much
+    tilted = up_vec[:, 2] < 0.3  # More lenient than before (cos(72°))
     
-    # Height failure (too low or flipped)
-    height_fail = (base_height < 0.15) | (base_height > 0.6)
+    # Height failure
+    height_fail = (base_height < 0.20) | (base_height > 0.60)
     
-    reset = base_contact | tilted | height_fail
+    # Time out
     time_out = episode_lengths >= max_episode_length - 1
-    reset = reset | time_out
+    
+    reset = base_contact | tilted | height_fail | time_out
 
     # ----------------------------
-    # Success metric (temporal consistency)
+    # IMPROVED: Success metric
     # ----------------------------
-    # Success = consistent trotting over time
-    is_success = (trot_quality > 0.65) & (wrong_pairs < 0.5)
+    
+    # Success requires:
+    # 1. Good bounding quality (> 0.6)
+    # 2. Actually achieving commanded velocity (within 20%)
+    # 3. No wrong patterns (stance phase or single-foot)
+    
+    velocity_achieved = torch.abs(forward_velocity - cmd_vx) < (0.2 * cmd_vx.abs() + 0.1)
+    
+    is_success = (
+        (bounding_quality > 0.6) &
+        velocity_achieved &
+        (both_pairs_contact < 0.5) &
+        (single_foot < 0.5) &
+        commanded_to_move
+    ) | (
+        # Or successfully idle when commanded
+        (torch.abs(forward_velocity) < 0.15) &
+        (~commanded_to_move)
+    )
+    
     consecutive_successes = torch.where(
         is_success,
         consecutive_successes + 1,
         torch.zeros_like(consecutive_successes)
     )
     
-    # Normalized success (for logging)
-    # Trot needs longer consistency than bounding (20+ steps)
-    success_rate = (consecutive_successes > 20).float().mean()
+    consecutive_successes = (consecutive_successes.float()).mean()
 
-    return total_reward.detach(), reset, success_rate
+    return total_reward.detach(), reset, consecutive_successes
+
 from typing import Tuple, Dict
 import math
 import torch
@@ -479,143 +530,174 @@ from torch import Tensor
 @torch.jit.script
 def compute_reward(
     root_states: torch.Tensor,
-    commands: torch.Tensor,
     dof_pos: torch.Tensor,
-    default_dof_pos: torch.Tensor,
     dof_vel: torch.Tensor,
     contact_forces: torch.Tensor,
+    commands: torch.Tensor,
     actions: torch.Tensor,
-    dt: float
+    default_dof_pos: torch.Tensor,
+    gravity_vec: torch.Tensor
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Reward function for quadruped trotting gait with velocity tracking.
-    
-    Args:
-        root_states: (num_envs, 13) tensor containing base position, orientation (quat), linear and angular velocities
-        commands: (num_envs, 3) tensor containing target [vx, vy, omega_z] commands
-        dof_pos: (num_envs, 12) tensor containing joint positions
-        default_dof_pos: (num_envs, 12) tensor containing default joint positions
-        dof_vel: (num_envs, 12) tensor containing joint velocities
-        contact_forces: (num_envs, 4, 3) tensor containing contact forces for 4 feet
-        actions: (num_envs, 12) tensor containing the actions
-        dt: timestep
+    Improved reward function for Go2 bounding gait.
     """
-    # Extract base states
+    
+    # Extract robot state
+    base_pos = root_states[:, :3]
     base_quat = root_states[:, 3:7]
     base_lin_vel = root_states[:, 7:10]
     base_ang_vel = root_states[:, 10:13]
     
-    # Transform velocities to base frame
-    base_lin_vel_local = quat_rotate_inverse(base_quat, base_lin_vel)
-    base_ang_vel_local = quat_rotate_inverse(base_quat, base_ang_vel)
+    # Transform velocities to body frame
+    base_lin_vel_body = quat_rotate_inverse(base_quat, base_lin_vel)
+    base_ang_vel_body = quat_rotate_inverse(base_quat, base_ang_vel)
     
-    # Gravity vector in base frame for orientation
-    gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=root_states.device, dtype=torch.float32)
-    projected_gravity = quat_rotate_inverse(base_quat, gravity_vec.repeat(root_states.shape[0], 1))
+    # Projected gravity for orientation
+    projected_gravity = quat_rotate_inverse(base_quat, gravity_vec)
     
-    # Contact detection (force threshold)
+    # Device reference
+    device = root_states.device
+    
+    # Contact detection
+    contact_force_norm = torch.norm(contact_forces, dim=2)  # (N, 4)
     contact_threshold = 1.0
-    foot_contacts = torch.norm(contact_forces, dim=2) > contact_threshold  # (num_envs, 4)
+    contacts = contact_force_norm > contact_threshold  # (N, 4) [FL, FR, RL, RR]
     
-    # Diagonal pairs: FL-RR (indices 0,3) and FR-RL (indices 1,2)
-    pair1_contact = foot_contacts[:, 0] & foot_contacts[:, 3]  # FL-RR
-    pair2_contact = foot_contacts[:, 1] & foot_contacts[:, 2]  # FR-RL
+    # Front and rear pair contacts
+    front_contacts = contacts[:, :2]  # FL, FR
+    rear_contacts = contacts[:, 2:]   # RL, RR
     
-    # ===== 1. Velocity Tracking Reward =====
-    vel_error_x = torch.square(commands[:, 0] - base_lin_vel_local[:, 0])
-    vel_error_y = torch.square(commands[:, 1] - base_lin_vel_local[:, 1])
-    vel_error_yaw = torch.square(commands[:, 2] - base_ang_vel_local[:, 2])
+    front_pair_contact = torch.sum(front_contacts.float(), dim=1)  # (N,)
+    rear_pair_contact = torch.sum(rear_contacts.float(), dim=1)    # (N,)
+    total_contacts = front_pair_contact + rear_pair_contact
     
-    velocity_tracking_temp = 1.0
-    velocity_reward = torch.exp(-velocity_tracking_temp * (vel_error_x + vel_error_y + vel_error_yaw))
+    # Command analysis
+    cmd_x = commands[:, 0]
+    cmd_magnitude = torch.norm(commands[:, :2], dim=1)
+    is_moving = (cmd_magnitude >= 0.1).float()
+    should_stand = (cmd_magnitude < 0.1).float()
     
-    # ===== 2. Trot Gait Pattern Reward =====
-    # Encourage alternating diagonal pairs
-    trot_pattern = (pair1_contact.float() - pair2_contact.float()).abs()
-    trot_gait_temp = 2.0
-    trot_reward = torch.exp(-trot_gait_temp * (1.0 - trot_pattern))
+    # Temperature parameters
+    temp_vel_tracking = 0.2
+    temp_upright = 0.3
+    temp_ang_vel = 0.5
+    temp_height = 0.5
+    temp_vertical_vel = 1.0
+    temp_contact_timing = 1.0
+    temp_stand_vel = 0.3
     
-    # ===== 3. Aerial Phase Reward =====
-    # Encourage brief flight phases (neither pair in full contact)
-    num_feet_contact = foot_contacts.sum(dim=1)
-    aerial_phase = (num_feet_contact == 0).float()
-    flight_phase_bonus = aerial_phase * 0.1
+    # 1. Forward velocity tracking (increased importance)
+    vel_x = base_lin_vel_body[:, 0]
+    vel_y = base_lin_vel_body[:, 1]
+    vel_tracking_error = torch.square(vel_x - cmd_x) + torch.square(vel_y - commands[:, 1])
+    vel_tracking_reward = torch.exp(-vel_tracking_error / temp_vel_tracking)
     
-    # ===== 4. Orientation Reward =====
-    # Penalize roll and pitch (keep torso upright)
-    up_vec_target = torch.tensor([0.0, 0.0, 1.0], device=root_states.device, dtype=torch.float32)
-    up_vec_target = up_vec_target.repeat(root_states.shape[0], 1)
-    up_vec = quat_rotate(base_quat, up_vec_target)
+    # 2. Upright orientation reward (critical - keep body upright)
+    # Gravity should point down in body frame
+    upright_error = torch.square(projected_gravity[:, 0]) + torch.square(projected_gravity[:, 1])
+    upright_reward = torch.exp(-upright_error / temp_upright)
     
-    orientation_error = torch.sum(torch.square(up_vec - up_vec_target), dim=1)
-    orientation_temp = 2.0
-    orientation_reward = torch.exp(-orientation_temp * orientation_error)
+    # 3. Angular velocity penalty (minimize roll/yaw rotation)
+    ang_vel_xy = torch.square(base_ang_vel_body[:, 0]) + torch.square(base_ang_vel_body[:, 2])
+    ang_vel_reward = torch.exp(-ang_vel_xy / temp_ang_vel)
     
-    # ===== 5. Angular Velocity Penalty (minimize unwanted rotation) =====
-    ang_vel_penalty_temp = 0.5
-    ang_vel_penalty = torch.exp(-ang_vel_penalty_temp * torch.sum(torch.square(base_ang_vel_local[:, :2]), dim=1))
+    # 4. Body height maintenance
+    base_height = root_states[:, 2]
+    target_height = 0.35
+    height_error = torch.square(base_height - target_height)
+    height_reward = torch.exp(-height_error / temp_height)
     
-    # ===== 6. Foot Slip Penalty =====
-    # Penalize lateral foot velocity when in contact
-    foot_slip_penalty = torch.tensor(0.0, device=root_states.device, dtype=torch.float32)
+    # 5. Vertical velocity reward (encourage explosive push-offs)
+    vertical_vel = base_lin_vel[:, 2]
+    # Reward positive vertical velocity during contact (push-off)
+    is_in_contact = (total_contacts > 0).float()
+    vertical_push_reward = is_in_contact * torch.clamp(vertical_vel, 0.0, 2.0)
+    vertical_vel_reward = torch.exp(vertical_push_reward / temp_vertical_vel) - 1.0
     
-    # ===== 7. Joint Acceleration Penalty (smoothness) =====
-    joint_acc_temp = 0.01
-    joint_acc_penalty = torch.exp(-joint_acc_temp * torch.sum(torch.square(dof_vel), dim=1))
+    # 6. Flight phase reward (encourage airborne time)
+    is_airborne = (total_contacts == 0).float()
+    flight_reward = is_airborne
     
-    # ===== 8. Action Rate Penalty (smoothness) =====
-    action_rate_temp = 0.01
-    action_rate_penalty = torch.exp(-action_rate_temp * torch.sum(torch.square(actions), dim=1))
+    # 7. Pair synchronization (more discriminative)
+    # Both feet in pair should have similar contact state
+    front_both_contact = (front_pair_contact == 2).float()
+    front_no_contact = (front_pair_contact == 0).float()
+    front_sync_score = front_both_contact + front_no_contact
     
-    # ===== 9. Joint Limit Penalty =====
-    # Encourage staying away from joint limits
-    dof_pos_normalized = (dof_pos - default_dof_pos)
-    joint_limit_temp = 0.1
-    joint_limit_penalty = torch.exp(-joint_limit_temp * torch.sum(torch.square(dof_pos_normalized), dim=1))
+    rear_both_contact = (rear_pair_contact == 2).float()
+    rear_no_contact = (rear_pair_contact == 0).float()
+    rear_sync_score = rear_both_contact + rear_no_contact
     
-    # ===== 10. Energy Efficiency =====
-    torque_penalty_temp = 0.0001
-    power = torch.sum(torch.square(actions) * torch.abs(dof_vel), dim=1)
-    energy_penalty = torch.exp(-torque_penalty_temp * power)
+    pair_sync_reward = 0.5 * (front_sync_score + rear_sync_score)
     
-    # ===== 11. Forward Progress Reward =====
-    forward_progress_temp = 0.5
-    forward_progress = torch.clamp(base_lin_vel_local[:, 0], min=0.0)
-    forward_reward = torch.exp(-forward_progress_temp * torch.square(commands[:, 0] - forward_progress))
+    # 8. Alternating gait (penalize all four feet or mixed contacts)
+    # Good states: 0 feet (flight), 2 front, 2 rear
+    good_contact_pattern = ((total_contacts == 0) | (total_contacts == 2)).float()
+    # Also check that when 2 contacts, they're from same pair
+    front_only = (front_pair_contact == 2) & (rear_pair_contact == 0)
+    rear_only = (rear_pair_contact == 2) & (front_pair_contact == 0)
+    valid_pair_contact = (front_only | rear_only).float()
     
-    # ===== 12. Foot Clearance Reward =====
-    # Encourage lifting feet during swing phase (simplified)
-    swing_pair1 = (~pair1_contact).float()
-    swing_pair2 = (~pair2_contact).float()
-    clearance_bonus = (swing_pair1 + swing_pair2) * 0.05
+    alternating_reward = good_contact_pattern * (1.0 + valid_pair_contact)
     
-    # ===== Total Reward Composition =====
-    total_reward = (
-        3.0 * velocity_reward +
-        2.0 * trot_reward +
-        1.0 * orientation_reward +
-        0.5 * ang_vel_penalty +
-        0.3 * joint_acc_penalty +
-        0.2 * action_rate_penalty +
-        0.3 * joint_limit_penalty +
-        0.2 * energy_penalty +
-        1.5 * forward_reward +
-        flight_phase_bonus +
-        clearance_bonus
+    # 9. Force symmetry within pairs (only when in contact)
+    front_in_contact = (front_pair_contact > 0).float()
+    rear_in_contact = (rear_pair_contact > 0).float()
+    
+    front_force_diff = torch.abs(contact_force_norm[:, 0] - contact_force_norm[:, 1])
+    rear_force_diff = torch.abs(contact_force_norm[:, 2] - contact_force_norm[:, 3])
+    
+    front_symmetry = front_in_contact * torch.exp(-front_force_diff / 50.0)
+    rear_symmetry = rear_in_contact * torch.exp(-rear_force_diff / 50.0)
+    force_symmetry_reward = 0.5 * (front_symmetry + rear_symmetry)
+    
+    # 10. Standing still reward (when commanded velocity is near zero)
+    standing_vel_error = torch.norm(base_lin_vel_body, dim=1) + torch.norm(base_ang_vel_body, dim=1)
+    standing_reward = should_stand * torch.exp(-standing_vel_error / temp_stand_vel) * (total_contacts == 4).float()
+    
+    # 11. Contact timing reward (encourage regular alternation)
+    # Penalize having same pair in contact for too long - implicitly via alternating reward
+    
+    # 12. Energy efficiency (limit joint velocities during stance)
+    joint_vel_norm = torch.mean(torch.square(dof_vel), dim=1)
+    energy_reward = is_in_contact * torch.exp(-joint_vel_norm / 100.0)
+    
+    # 13. Action smoothness
+    action_norm = torch.mean(torch.square(actions), dim=1)
+    action_reward = torch.exp(-action_norm / 2.0)
+    
+    # Combine rewards with adjusted weights
+    bounding_reward = (
+        5.0 * vel_tracking_reward +          # Increased: critical for task
+        4.0 * upright_reward +                # Increased: robot was falling
+        3.0 * ang_vel_reward +                # Increased: stability crucial
+        2.0 * height_reward +                 # Keep stable
+        2.0 * vertical_vel_reward +           # New emphasis on explosiveness
+        2.5 * flight_reward +                 # Increased: need more airtime
+        2.0 * pair_sync_reward +              # Keep important
+        3.0 * alternating_reward +            # Increased: core gait pattern
+        1.0 * force_symmetry_reward +         # Keep for balance
+        0.5 * energy_reward +                 # Minor consideration
+        0.5 * action_reward                   # Minor consideration
     )
     
+    # Total reward
+    total_reward = is_moving * bounding_reward + standing_reward * 10.0
+    
+    # Reward components dictionary
     reward_components = {
-        "velocity_reward": velocity_reward,
-        "trot_reward": trot_reward,
-        "orientation_reward": orientation_reward,
-        "ang_vel_penalty": ang_vel_penalty,
-        "joint_acc_penalty": joint_acc_penalty,
-        "action_rate_penalty": action_rate_penalty,
-        "joint_limit_penalty": joint_limit_penalty,
-        "energy_penalty": energy_penalty,
-        "forward_reward": forward_reward,
-        "flight_phase_bonus": flight_phase_bonus,
-        "clearance_bonus": clearance_bonus
+        "vel_tracking": vel_tracking_reward,
+        "upright": upright_reward,
+        "ang_vel": ang_vel_reward,
+        "height": height_reward,
+        "vertical_vel": vertical_vel_reward,
+        "flight": flight_reward,
+        "pair_sync": pair_sync_reward,
+        "alternating": alternating_reward,
+        "force_symmetry": force_symmetry_reward,
+        "standing": standing_reward,
+        "energy": energy_reward,
+        "action": action_reward
     }
     
     return total_reward, reward_components

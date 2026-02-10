@@ -39,7 +39,7 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 from typing import Tuple, Dict
 
 
-class Go2w(VecTask):
+class Go2wAerialcrossover(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
 
@@ -125,6 +125,8 @@ class Go2w(VecTask):
         self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)  # shape: num_envs, num_bodies, xyz axis
         self.torques = gymtorch.wrap_tensor(torques).view(self.num_envs, self.num_dof)
 
+        print("Contact forces:", self.contact_forces.shape)
+
         self.commands = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
         self.commands_y = self.commands.view(self.num_envs, 3)[..., 1]
         self.commands_x = self.commands.view(self.num_envs, 3)[..., 0]
@@ -176,7 +178,7 @@ class Go2w(VecTask):
 
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_EFFORT
-        asset_options.collapse_fixed_joints = True
+        asset_options.collapse_fixed_joints = False
         asset_options.replace_cylinder_with_capsule = True
         asset_options.flip_visual_attachments = True
         asset_options.fix_base_link = self.cfg["env"]["urdfAsset"]["fixBaseLink"]
@@ -202,7 +204,11 @@ class Go2w(VecTask):
         knee_names = [s for s in body_names if "thigh" in s]
         self.knee_indices = torch.zeros(len(knee_names), dtype=torch.long, device=self.device, requires_grad=False)
         self.base_index = 0
-
+        
+        # print("Body names:", body_names )
+        # print("feet names:", feet_names )
+        # print("knee names:", knee_names )
+        # print("DOF names:", self.dof_names )
         dof_props = self.gym.get_asset_dof_properties(go2w_asset)
         self.torque_limits = torch.tensor(
                                 dof_props['effort'],
@@ -243,6 +249,8 @@ class Go2w(VecTask):
             self.knee_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.go2w_handles[0], knee_names[i])
 
         self.base_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.go2w_handles[0], "base")
+        print("Feet indices:", self.feet_indices)
+        print("Knee indices:", self.knee_indices)
 
     def pre_physics_step(self, actions):
         self.actions = actions.to(self.device)
@@ -428,6 +436,34 @@ def compute_go2w_observations(root_states,
 #####################################################################
 ###=========================jit functions=========================###
 #####################################################################
+def quat_to_rpy(q):
+    """
+    Convert quaternion to roll, pitch, yaw.
+    
+    Args:
+        q: Tensor of shape (N, 4) in (x, y, z, w) format
+    
+    Returns:
+        roll, pitch, yaw: each of shape (N,)
+    """
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+
+    # Roll (x-axis rotation)
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(sinr, cosr)
+
+    # Pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = torch.clamp(sinp, -1.0, 1.0)  # numerical safety
+    pitch = torch.asin(sinp)
+
+    # Yaw (z-axis rotation)
+    siny = 2.0 * (w * z + x * y)
+    cosy = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny, cosy)
+
+    return roll, pitch, yaw
 
 
 @torch.jit.script

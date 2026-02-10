@@ -60,14 +60,14 @@ env:
     staticFriction: 1.0
   randomCommandVelocityRanges:
     linear_x:
-    - -2.0
+    - 0.0
     - 2.0
     linear_y:
-    - -1.0
-    - 1.0
+    - 0.0
+    - 0.0
     yaw:
-    - -1.0
-    - 1.0
+    - 0.0
+    - 0.0
   urdfAsset:
     collapseFixedJoints: true
     defaultDofDriveMode: 4

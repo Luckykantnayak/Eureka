@@ -1,0 +1,13 @@
+task: Go2wFrontflip
+env_name: go2w_frontflip
+description: >
+  To make the quadruped robot to execute a front flip (forward somersault) conditioned on the commanded forward velocity.
+  When the commanded forward velocity vx is strictly positive, the robot should crouch to build energy, explosively launch upward while initiating forward pitch rotation,
+  complete a full 360-degree rotation around its lateral (pitch) axis while airborne, and land stably on all four feet in an upright orientation with minimal post-landing motion.
+  The flip should be performed approximately in place with minimal horizontal drift, the rotation should be clean without excessive roll or yaw deviation, 
+  and the robot must maintain sufficient height throughout the airborne phase to complete the rotation before touchdown. 
+  When the commanded forward velocity vx is zero or negative, the robot should remain idle in a stable standing posture with all feet on the ground, minimal base motion, 
+  low angular velocities, and low actuation effort. The robot should ignore lateral velocity and yaw commands, prioritizing explosive launch power, 
+  fast rotational velocity during flight, proper timing to achieve upright orientation before landing, and controlled impact absorption for stable recovery after touchdown.
+
+max_iterations: 3000

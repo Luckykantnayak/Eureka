@@ -1,0 +1,12 @@
+task: Go2wAerialcrossover
+env_name: go2w_aerialcrossover
+description: >
+           When commanded with positive forward velocity (vx > 0), the wheeled-legged robot should carve forward smoothly on its wheels
+           while briefly lifting alternating diagonal leg pairs into the air. These rapid crossover wave motions of the legs occur without
+           breaking wheel contact and are used to actively reshape the robot’s inertia and base orientation. The legs must re-enter contact in phase, 
+           allowing the robot to transition seamlessly back into a stable skating wave with increased forward speed and agile directional response.
+           This skill treats leg motion as an inertial control surface rather than a support requirement, rewarding fast, 
+           rhythmic aerial leg alternation that enhances forward locomotion stability and agility.
+           When commanded with zero or negative forward velocity (vx ≤ 0) and random vy or yaw rate, the robot should remain stationary in a stable, seated posture   
+
+max_iterations: 3000

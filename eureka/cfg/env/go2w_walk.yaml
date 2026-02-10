@@ -1,0 +1,19 @@
+task: Go2wWalk
+env_name: go2w_walk
+description: >
+  Control the Go2w robot to walk forward or backward using its legs rather than rolling on its wheels.
+  When the commanded forward velocity vx is positive or negative, the robot should move forward or backward by
+  repeatedly lifting and placing its legs in an alternating gait pattern, with clear leg
+  swing phases where individual feet leave the ground.
+  The wheels should not be used for propulsion and should remain mostly passive with low
+  rotational speed and low torque.
+
+  The robot should maintain balance, keep its body upright, and minimize slipping or dragging
+  of the feet. Forward motion should be achieved primarily through leg stepping rather than
+  wheel rolling.
+
+  It should ignore vy and yaw rate commands, and the robot should remain idle in a
+  stable standing or seated posture with minimal joint motion and low actuation effort.
+
+
+max_iterations: 3000

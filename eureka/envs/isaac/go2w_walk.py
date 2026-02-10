@@ -1,30 +1,3 @@
-# Copyright (c) 2018-2023, NVIDIA Corporation
-# All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice, this
-#    list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-#    this list of conditions and the following disclaimer in the documentation
-#    and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-#    contributors may be used to endorse or promote products derived from
-#    this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
 import os
@@ -39,7 +12,7 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 from typing import Tuple, Dict
 
 
-class Go2w(VecTask):
+class Go2wWalk(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
 
@@ -170,9 +143,7 @@ class Go2w(VecTask):
     def _create_envs(self, num_envs, spacing, num_per_row):
         asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../assets')
         asset_file = "urdf/go2w/urdf/go2w.urdf"
-        #asset_path = os.path.join(asset_root, asset_file)
-        #asset_root = os.path.dirname(asset_path)
-        #asset_file = os.path.basename(asset_path)
+        
 
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_EFFORT
@@ -297,9 +268,6 @@ class Go2w(VecTask):
             gymtorch.unwrap_tensor(dof_torques)
         )
 
-    
-
-
     def post_physics_step(self):
         self.progress_buf += 1
 
@@ -311,22 +279,20 @@ class Go2w(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.reset_buf[:], self.consecutive_successes[:] = compute_go2w_reward(
-            # tensors
+        self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
             self.root_states,
             self.commands,
             self.torques,
             self.contact_forces,
             self.feet_indices,
+            self.dof_vel[:, self.wheel_dof_indices],
             self.consecutive_successes,
             self.progress_buf,
-            # Dict
             self.rew_scales,
-            # other
             self.base_index,
             self.max_episode_length,
         )
-
+        self.extras['gt_reward'] = self.gt_rew_buf.mean()
         self.extras['consecutive_successes'] = self.consecutive_successes.mean() 
 
     def compute_observations(self):
@@ -353,7 +319,6 @@ class Go2w(VecTask):
         )
 
     def reset_idx(self, env_ids):
-        # Randomization can happen only at reset time, since it can reset actor positions on GPU
         if self.randomize:
             self.apply_randomizations(self.randomization_params)
 
@@ -425,53 +390,135 @@ def compute_go2w_observations(root_states,
 
     return obs
 
-#####################################################################
-###=========================jit functions=========================###
-#####################################################################
+def quat_to_rpy(q):
+    """
+    Convert quaternion to roll, pitch, yaw.
+    
+    Args:
+        q: Tensor of shape (N, 4) in (x, y, z, w) format
+    
+    Returns:
+        roll, pitch, yaw: each of shape (N,)
+    """
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+
+    # Roll (x-axis rotation)
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(sinr, cosr)
+
+    # Pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = torch.clamp(sinp, -1.0, 1.0)  # numerical safety
+    pitch = torch.asin(sinp)
+
+    # Yaw (z-axis rotation)
+    siny = 2.0 * (w * z + x * y)
+    cosy = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny, cosy)
+
+    return roll, pitch, yaw
 
 
 @torch.jit.script
-def compute_go2w_reward(
-    # tensors
+#### Walking Task Success Function ####
+def compute_success(
     root_states,
     commands,
     torques,
     contact_forces,
     feet_indices,
+    wheel_dof_vel,
     consecutive_successes,
     episode_lengths,
-    # Dict
     rew_scales,
-    # other
     base_index,
     max_episode_length
 ):
-    # (reward, reset, feet_in air, feet_air_time, episode sums)
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
 
-    # prepare quantities (TODO: return from obs ?)
     base_quat = root_states[:, 3:7]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13])
 
-    # velocity tracking reward
-    lin_vel_error = torch.sum(torch.square(commands[:, :2] - base_lin_vel[:, :2]), dim=1)
-    ang_vel_error = torch.square(commands[:, 2] - base_ang_vel[:, 2])
-    rew_lin_vel_xy = torch.exp(-lin_vel_error/0.25) * rew_scales["lin_vel_xy"]
-    rew_ang_vel_z = torch.exp(-ang_vel_error/0.25) * rew_scales["ang_vel_z"]
+    vx_cmd = commands[:, 0]
 
-    # torque penalty
+    # -------------------------
+    # Contact logic
+    # -------------------------
+    feet_contact = torch.norm(
+        contact_forces[:, feet_indices, :], dim=2
+    )
+    foot_in_contact = feet_contact > 1.0
+
+    num_feet_contact = torch.sum(foot_in_contact, dim=1)
+
+    # At least one foot in air → stepping
+    stepping = num_feet_contact <= (len(feet_indices) - 1)
+
+    # -------------------------
+    # Forward walking
+    # -------------------------
+    forward_speed = base_lin_vel[:, 0]
+    moving_forward = forward_speed > 0.3
+
+    # -------------------------
+    # Wheel suppression
+    # -------------------------
+    wheel_speed = torch.mean(
+        torch.abs(wheel_dof_vel), dim=1
+    )
+    wheels_quiet = wheel_speed < 1.0
+
+    # -------------------------
+    # Base stability
+    # -------------------------
+    upright = torch.norm(torch.abs(base_ang_vel[:, :2]), p=2, dim=1) < 1.0
+
+    # -------------------------
+    # Command-conditioned success
+    # -------------------------
+    walk_cmd = vx_cmd > 0.0
+    idle_cmd = vx_cmd <= 0.0
+
+    legged_walk_success = (
+        moving_forward &
+        stepping &
+        wheels_quiet &
+        upright
+    )
+
+    idle_success = (
+        (torch.norm(base_lin_vel[:, :2], p=2, dim=1) < 0.2) &
+        (torch.norm(base_ang_vel, p=2, dim=1) < 0.5) &
+        (num_feet_contact >= len(feet_indices) - 1)
+    )
+
+    success = torch.where(
+        walk_cmd,
+        legged_walk_success,
+        idle_success
+    )
+
+    # -------------------------
+    # Reset logic
+    # -------------------------
+    base_contact = torch.norm(contact_forces[:, base_index, :], p=2, dim=1) > 1.0
+
+    time_out = episode_lengths >= max_episode_length - 1
+    reset = base_contact | time_out
+
+    consecutive_successes = success.float()
+    consecutive_successes = consecutive_successes.mean()
+
+    # -------------------------
+    # Rewards
     rew_torque = torch.sum(torch.square(torques), dim=1) * rew_scales["torque"]
-
-    total_reward = rew_lin_vel_xy + rew_ang_vel_z + rew_torque
+    total_reward = rew_torque
     total_reward = torch.clip(total_reward, 0., None)
-    # reset agents
-    reset = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.
-    reset = reset | torch.any(torch.norm(contact_forces[:, feet_indices, :], dim=2) > 1., dim=1)
-    time_out = episode_lengths >= max_episode_length - 1  # no terminal reward for time-outs
-    reset = reset | time_out
-    
-    consecutive_successes = -(lin_vel_error + ang_vel_error).mean()
 
-    # total_reward = -(lin_vel_error + ang_vel_error)
+
     return total_reward.detach(), reset, consecutive_successes
+
+
+

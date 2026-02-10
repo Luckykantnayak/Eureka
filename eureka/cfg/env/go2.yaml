@@ -1,4 +1,8 @@
 task: Go2
 env_name: go2
-description: to make the quadruped follow randomly chosen x,y, and yaw target velocities
-max_iterations: 1000
+description: to make the quadruped robot execute a stable and rhythmic trot gait while accurately tracking randomly sampled forward linear velocity commands along the x-axis.
+  The robot should move using synchronized diagonal leg pairs that alternate between push-off and landing phases, producing brief and consistent aerial phases between contacts.
+  Maintain a forward-facing torso with minimal roll, yaw and pitch of a trot, and generate steady,efficient forward propulsion in the commanded direction.
+  The gait should remain robust to rapid velocity changes, minimize foot scuffing and lateral slip,
+  recover gracefully from disturbances, and produce a fast, natural, and agile trotting motion suitable for dynamic quadrupedal locomotion.
+max_iterations: 3000

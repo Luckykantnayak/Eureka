@@ -1,30 +1,3 @@
-# Copyright (c) 2018-2023, NVIDIA Corporation
-# All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice, this
-#    list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-#    this list of conditions and the following disclaimer in the documentation
-#    and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-#    contributors may be used to endorse or promote products derived from
-#    this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
 import os
@@ -39,7 +12,7 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 from typing import Tuple, Dict
 
 
-class Go2w(VecTask):
+class Go2wFrontflip(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
 
@@ -170,9 +143,7 @@ class Go2w(VecTask):
     def _create_envs(self, num_envs, spacing, num_per_row):
         asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../assets')
         asset_file = "urdf/go2w/urdf/go2w.urdf"
-        #asset_path = os.path.join(asset_root, asset_file)
-        #asset_root = os.path.dirname(asset_path)
-        #asset_file = os.path.basename(asset_path)
+        
 
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_EFFORT
@@ -297,9 +268,6 @@ class Go2w(VecTask):
             gymtorch.unwrap_tensor(dof_torques)
         )
 
-    
-
-
     def post_physics_step(self):
         self.progress_buf += 1
 
@@ -311,8 +279,7 @@ class Go2w(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.reset_buf[:], self.consecutive_successes[:] = compute_go2w_reward(
-            # tensors
+        self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
             self.root_states,
             self.commands,
             self.torques,
@@ -320,13 +287,11 @@ class Go2w(VecTask):
             self.feet_indices,
             self.consecutive_successes,
             self.progress_buf,
-            # Dict
             self.rew_scales,
-            # other
             self.base_index,
             self.max_episode_length,
         )
-
+        self.extras['gt_reward'] = self.gt_rew_buf.mean()
         self.extras['consecutive_successes'] = self.consecutive_successes.mean() 
 
     def compute_observations(self):
@@ -353,7 +318,6 @@ class Go2w(VecTask):
         )
 
     def reset_idx(self, env_ids):
-        # Randomization can happen only at reset time, since it can reset actor positions on GPU
         if self.randomize:
             self.apply_randomizations(self.randomization_params)
 
@@ -425,14 +389,39 @@ def compute_go2w_observations(root_states,
 
     return obs
 
-#####################################################################
-###=========================jit functions=========================###
-#####################################################################
+def quat_to_rpy(q):
+    """
+    Convert quaternion to roll, pitch, yaw.
+    
+    Args:
+        q: Tensor of shape (N, 4) in (x, y, z, w) format
+    
+    Returns:
+        roll, pitch, yaw: each of shape (N,)
+    """
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+
+    # Roll (x-axis rotation)
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(sinr, cosr)
+
+    # Pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = torch.clamp(sinp, -1.0, 1.0)  # numerical safety
+    pitch = torch.asin(sinp)
+
+    # Yaw (z-axis rotation)
+    siny = 2.0 * (w * z + x * y)
+    cosy = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny, cosy)
+
+    return roll, pitch, yaw
 
 
 @torch.jit.script
-def compute_go2w_reward(
-    # tensors
+#### Airspin Task Success Function ####
+def compute_success(
     root_states,
     commands,
     torques,
@@ -440,38 +429,244 @@ def compute_go2w_reward(
     feet_indices,
     consecutive_successes,
     episode_lengths,
-    # Dict
     rew_scales,
-    # other
     base_index,
     max_episode_length
-):
-    # (reward, reset, feet_in air, feet_air_time, episode sums)
+    ):
     # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
 
-    # prepare quantities (TODO: return from obs ?)
+    batch_size = root_states.shape[0]
+    device = root_states.device
+    
+    # ----------------------------
+    # Base state extraction
+    # ----------------------------
+    base_pos = root_states[:, :3]
     base_quat = root_states[:, 3:7]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13])
-
-    # velocity tracking reward
-    lin_vel_error = torch.sum(torch.square(commands[:, :2] - base_lin_vel[:, :2]), dim=1)
-    ang_vel_error = torch.square(commands[:, 2] - base_ang_vel[:, 2])
-    rew_lin_vel_xy = torch.exp(-lin_vel_error/0.25) * rew_scales["lin_vel_xy"]
-    rew_ang_vel_z = torch.exp(-ang_vel_error/0.25) * rew_scales["ang_vel_z"]
-
-    # torque penalty
-    rew_torque = torch.sum(torch.square(torques), dim=1) * rew_scales["torque"]
-
-    total_reward = rew_lin_vel_xy + rew_ang_vel_z + rew_torque
-    total_reward = torch.clip(total_reward, 0., None)
-    # reset agents
-    reset = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.
-    reset = reset | torch.any(torch.norm(contact_forces[:, feet_indices, :], dim=2) > 1., dim=1)
-    time_out = episode_lengths >= max_episode_length - 1  # no terminal reward for time-outs
-    reset = reset | time_out
     
-    consecutive_successes = -(lin_vel_error + ang_vel_error).mean()
-
-    # total_reward = -(lin_vel_error + ang_vel_error)
-    return total_reward.detach(), reset, consecutive_successes
+    base_height = base_pos[:, 2]
+    
+    # Angular velocities in body frame
+    roll_rate = base_ang_vel[:, 0]
+    pitch_rate = base_ang_vel[:, 1]  # Front flip = pitch rotation
+    yaw_rate = base_ang_vel[:, 2]
+    
+    # Get roll, pitch, yaw angles
+    roll, pitch, yaw = quat_to_rpy(base_quat)
+    
+    # Command extraction
+    flip_cmd = commands[:, 0] > 0.5  # Flip when commanded
+    
+    # ----------------------------
+    # Contact detection
+    # ----------------------------
+    contact_thresh = 1.0
+    foot_forces = torch.norm(contact_forces[:, feet_indices, :], dim=2)
+    foot_contact = (foot_forces > contact_thresh).float()
+    any_foot_contact = torch.any(foot_contact > 0.5, dim=1)
+    
+    all_feet_contact = torch.all(foot_contact > 0.5, dim=1)
+    airborne = ~any_foot_contact
+    
+    # ----------------------------
+    # Front flip phases
+    # ----------------------------
+    
+    # Phase 1: PRE-LAUNCH (crouch and prepare)
+    # - All feet on ground
+    # - Low height (crouching)
+    # - Minimal motion
+    crouched = all_feet_contact & (base_height < 0.38)
+    stable_stance = (torch.abs(pitch_rate) < 0.5) & (torch.abs(roll_rate) < 0.5)
+    pre_launch = crouched & stable_stance
+    
+    # Phase 2: LAUNCH (explosive jump with forward rotation)
+    # - Leaving ground or just airborne
+    # - Upward velocity
+    # - Starting to pitch forward
+    upward_vel = root_states[:, 9]  # World frame Z velocity
+    launching = (
+        (upward_vel > 0.5) &
+        airborne &
+        (base_height > 0.28) &
+        (pitch_rate < -1.0)  # Pitching forward (negative = nose down)
+    )
+    
+    # Phase 3: ROTATION (in-air spinning)
+    # - Fully airborne
+    # - High pitch rate (rotating)
+    # - Sufficient height
+    # - Accumulated rotation
+    high_airborne = airborne & (base_height > 0.5)
+    fast_pitch_rotation = torch.abs(pitch_rate) > 3.0  # Fast forward rotation
+    
+    # Track rotation progress (pitch should go from 0 -> -π -> -2π or 0 -> π -> 2π)
+    # We want forward flip, so pitch should decrease (negative direction)
+    rotation_progress = torch.abs(pitch) / (2.0 * torch.pi)  # 0 to 1+ for full rotation
+    
+    good_rotation = high_airborne & fast_pitch_rotation & (rotation_progress > 0.2)
+    
+    # Phase 4: COMPLETION (full rotation achieved)
+    # - Completed ~360° pitch rotation
+    # - Slowing rotation for landing
+    full_rotation = torch.abs(pitch) > 5.5  # ~315° (allowing some margin before 360°)
+    rotation_slowing = torch.abs(pitch_rate) < 5.0  # Starting to slow down
+    completion_phase = airborne & full_rotation & rotation_slowing
+    
+    # Phase 5: LANDING (controlled touchdown)
+    # - Feet touching ground
+    # - Body near upright (completed rotation)
+    # - Low velocities
+    landing = any_foot_contact & (base_height < 0.5)
+    
+    # Check if landed with reasonable orientation (within 45° of upright)
+    landed_upright = landing & (torch.abs(pitch) < 0.8) & (torch.abs(roll) < 0.8)
+    
+    # Stable after landing
+    low_ang_vel = (torch.abs(pitch_rate) < 1.0) & (torch.abs(roll_rate) < 1.0)
+    low_lin_vel = torch.norm(base_lin_vel[:, :2], dim=1) < 0.5
+    stable_landing = landed_upright & low_ang_vel & low_lin_vel
+    
+    # ----------------------------
+    # Flip quality metrics
+    # ----------------------------
+    
+    # 1. Launch quality (explosive upward motion)
+    launch_quality = torch.exp(-(upward_vel.clamp(max=3.0) - 2.0) ** 2 / 0.5)
+    launch_quality = launch_quality * launching.float()
+    
+    # 2. Rotation speed (fast enough to complete flip)
+    rotation_speed_score = (torch.abs(pitch_rate) / 5.0).clamp(0, 1)
+    rotation_speed_score = rotation_speed_score * good_rotation.float()
+    
+    # 3. Height maintenance (stay high enough during flip)
+    height_score = (base_height.clamp(max=0.8) / 0.8)
+    height_score = height_score * airborne.float()
+    
+    # 4. Rotation alignment (minimize roll/yaw during pitch)
+    alignment_score = torch.exp(-(torch.abs(roll) + torch.abs(yaw_rate)) / 1.0)
+    alignment_score = alignment_score * airborne.float()
+    
+    # 5. Landing precision (land upright)
+    landing_precision = torch.exp(-torch.abs(pitch) / 0.5) * landed_upright.float()
+    
+    # 6. In-place constraint (minimize lateral drift)
+    # Track cumulative XY displacement (would need to be stored between steps)
+    lateral_vel = torch.norm(base_lin_vel[:, :2], dim=1)
+    in_place_score = torch.exp(-lateral_vel / 0.5)
+    
+    # ----------------------------
+    # Flip quality composite score
+    # ----------------------------
+    flip_quality = (
+        pre_launch.float() * 0.10 +           # 10%: Proper setup
+        launch_quality * 0.20 +                # 20%: Explosive launch
+        rotation_speed_score * 0.25 +          # 25%: Fast rotation
+        height_score * 0.15 +                  # 15%: Maintain height
+        alignment_score * 0.15 +               # 15%: Clean rotation axis
+        landing_precision * 0.10 +             # 10%: Upright landing
+        in_place_score * 0.05                  # 5%: Minimal drift
+    )
+    
+    # ----------------------------
+    # Rewards (command-conditioned)
+    # ----------------------------
+    
+    # When flip commanded
+    rew_flip = flip_quality * rew_scales.get("flip", 3.0) * flip_cmd.float()
+    
+    # Specific phase rewards for shaping
+    rew_launch = launching.float() * rew_scales.get("launch", 0.5) * flip_cmd.float()
+    rew_rotation = good_rotation.float() * rew_scales.get("rotation", 1.0) * flip_cmd.float()
+    rew_completion = completion_phase.float() * rew_scales.get("completion", 2.0) * flip_cmd.float()
+    rew_landing = stable_landing.float() * rew_scales.get("landing", 1.5) * flip_cmd.float()
+    
+    # When idle (no flip commanded) - reward staying still
+    idle_reward = (
+        all_feet_contact.float() * 
+        low_ang_vel.float() * 
+        low_lin_vel.float() * 
+        rew_scales.get("idle", 0.5) * 
+        (~flip_cmd).float()
+    )
+    
+    # Energy penalties
+    rew_torque = -torch.sum(torch.abs(torques), dim=1) * rew_scales.get("torque", 0.0001)
+    
+    # Penalty for excessive drift
+    drift_penalty = -lateral_vel * rew_scales.get("drift_penalty", 0.1)
+    
+    # Penalty for bad landing (high impact)
+    impact_forces = torch.sum(foot_forces, dim=1)
+    impact_penalty = -(impact_forces.clamp(max=500.0) / 500.0) * landing.float() * rew_scales.get("impact_penalty", 0.2)
+    
+    total_reward = (
+        rew_flip +
+        rew_launch +
+        rew_rotation +
+        rew_completion +
+        rew_landing +
+        idle_reward +
+        rew_torque +
+        drift_penalty +
+        impact_penalty
+    )
+    
+    total_reward = torch.clamp(total_reward, min=-10.0, max=10.0)
+    
+    # ----------------------------
+    # Reset conditions
+    # ----------------------------
+    
+    # Body contact (belly flop)
+    base_contact = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.0
+    
+    # Excessive tilt during non-airborne phases
+    up_vec_local = torch.zeros(batch_size, 3, dtype=torch.float, device=device)
+    up_vec_local[:, 2] = 1.0
+    up_vec = quat_rotate(base_quat, up_vec_local)
+    excessive_tilt = (up_vec[:, 2] < 0.2) & (~airborne)  # >78° while on ground
+    
+    # Failed landing (landed but badly oriented)
+    bad_landing = landing & (torch.abs(pitch) > 1.5) & (episode_lengths > 50)
+    
+    # Timeout
+    time_out = episode_lengths >= max_episode_length - 1
+    
+    reset = base_contact | excessive_tilt | bad_landing | time_out
+    
+    # ----------------------------
+    # Success metric
+    # ----------------------------
+    
+    # Complete flip success criteria:
+    # 1. Launched successfully
+    # 2. Completed full rotation (|pitch| > 5.5 radians)
+    # 3. Landed with all feet
+    # 4. Final orientation upright (|pitch| < 0.8, |roll| < 0.8)
+    # 5. Stable after landing
+    
+    # Track if flip was completed this episode (would need persistent state)
+    flip_completed = (
+        stable_landing &
+        (episode_lengths > 30)  # Minimum time for flip
+    )
+    
+    # For command-conditioned success
+    flip_success = flip_completed & flip_cmd
+    idle_success = (all_feet_contact & low_ang_vel & low_lin_vel) & (~flip_cmd)
+    
+    is_success = flip_success | idle_success
+    
+    # Track consecutive successful flips
+    consecutive_successes = torch.where(
+        is_success,
+        consecutive_successes + 1,
+        torch.zeros_like(consecutive_successes)
+    )
+    consecutive_successes = (consecutive_successes.float()).mean()
+    
+    
+    return total_reward.detach(), reset, consecutive_successes.detach()

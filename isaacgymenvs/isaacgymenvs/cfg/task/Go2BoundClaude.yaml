@@ -43,7 +43,7 @@ env:
     RR_thigh_joint: 1.0
   enableCameraSensors: false
   envSpacing: 4.0
-  env_name: go2Claude
+  env_name: go2_boundClaude
   learn:
     angularVelocityScale: 0.25
     angularVelocityZRewardScale: 0.5
@@ -63,11 +63,11 @@ env:
     - -2.0
     - 2.0
     linear_y:
-    - -1.0
-    - 1.0
+    - 0.0
+    - 0.0
     yaw:
-    - -1.0
-    - 1.0
+    - 0.0
+    - 0.0
   urdfAsset:
     collapseFixedJoints: true
     defaultDofDriveMode: 4
@@ -82,7 +82,7 @@ env:
     - 0
     - 4
     refEnv: 0
-name: Go2Claude
+name: Go2BoundClaude
 physics_engine: ${..physics_engine}
 sim:
   dt: 0.02

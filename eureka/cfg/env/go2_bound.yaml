@@ -1,0 +1,14 @@
+task: Go2Bound
+env_name: go2_bound
+description: >
+  Control the Go2 robot to execute a dynamic bounding gait while tracking commanded forward velocities in the x-direction.
+  The robot should alternate between synchronized front-pair contacts (both front legs together) and synchronized rear-pair contacts (both rear legs together),
+  with ballistic flight phases between each contact where all feet leave the ground. During bounding, the robot must maintain forward-facing orientation with minimal
+  roll and yaw deviation, allow natural pitch oscillation during the aerial and landing phases, and ensure left-right force symmetry within each pair to prevent lateral
+  drift. The gait should exhibit clear phase alternation between front and rear contacts with no simultaneous four-foot stance phases, produce explosive push-offs generating 
+  sufficient vertical velocity for observable airborne time, and maintain consistent body height without excessive bouncing or crouching.
+  Contact forces should be balanced between left and right feet within each pair, joint velocities should minimize slipping when feet are in contact with the ground, 
+  and the robot should track the commanded forward velocity smoothly while bounding. When commanded velocities are near zero, the robot should transition to a stable standing
+  posture with all feet planted, minimal body motion, and low angular velocities. The bounding pattern should remain rhythmic and stable across varying speeds, demonstrate efficient
+  energy transfer through proper timing of leg extensions, and recover from perturbations while maintaining the characteristic paired-contact flight-phase structure that defines quadrupedal bounding locomotion.
+max_iterations: 3000

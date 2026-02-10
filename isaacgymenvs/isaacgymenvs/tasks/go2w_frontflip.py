@@ -39,7 +39,7 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 from typing import Tuple, Dict
 
 
-class Go2w(VecTask):
+class Go2wFrontflip(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
 
@@ -176,7 +176,7 @@ class Go2w(VecTask):
 
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_EFFORT
-        asset_options.collapse_fixed_joints = True
+        asset_options.collapse_fixed_joints = False
         asset_options.replace_cylinder_with_capsule = True
         asset_options.flip_visual_attachments = True
         asset_options.fix_base_link = self.cfg["env"]["urdfAsset"]["fixBaseLink"]
@@ -428,6 +428,34 @@ def compute_go2w_observations(root_states,
 #####################################################################
 ###=========================jit functions=========================###
 #####################################################################
+def quat_to_rpy(q):
+    """
+    Convert quaternion to roll, pitch, yaw.
+    
+    Args:
+        q: Tensor of shape (N, 4) in (x, y, z, w) format
+    
+    Returns:
+        roll, pitch, yaw: each of shape (N,)
+    """
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+
+    # Roll (x-axis rotation)
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(sinr, cosr)
+
+    # Pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = torch.clamp(sinp, -1.0, 1.0)  # numerical safety
+    pitch = torch.asin(sinp)
+
+    # Yaw (z-axis rotation)
+    siny = 2.0 * (w * z + x * y)
+    cosy = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny, cosy)
+
+    return roll, pitch, yaw
 
 
 @torch.jit.script

@@ -151,10 +151,10 @@ class Go2(VecTask):
 
         body_names = self.gym.get_asset_rigid_body_names(go2_asset)
         self.dof_names = self.gym.get_asset_dof_names(go2_asset)
-        extremity_name = "SHANK" if asset_options.collapse_fixed_joints else "FOOT"
+        extremity_name = "calf" if asset_options.collapse_fixed_joints else "FOOT"
         feet_names = [s for s in body_names if extremity_name in s]
         self.feet_indices = torch.zeros(len(feet_names), dtype=torch.long, device=self.device, requires_grad=False)
-        knee_names = [s for s in body_names if "THIGH" in s]
+        knee_names = [s for s in body_names if "thigh" in s]
         self.knee_indices = torch.zeros(len(knee_names), dtype=torch.long, device=self.device, requires_grad=False)
         self.base_index = 0
 
@@ -304,32 +304,168 @@ def compute_success(
     commands,
     torques,
     contact_forces,
-    knee_indices,
+    feet_indices,
     consecutive_successes,
     episode_lengths,
     rew_scales,
     base_index,
-    max_episode_length
+    max_episode_length,
+    dt=0.02  # timestep
 ):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int, float) -> Tuple[Tensor, Tensor, Tensor]
 
+    batch_size = root_states.shape[0]
+    device = root_states.device
+
+    # ----------------------------
+    # Base velocities
+    # ----------------------------
     base_quat = root_states[:, 3:7]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13])
 
-    lin_vel_error = torch.sum(torch.square(commands[:, :2] - base_lin_vel[:, :2]), dim=1)
-    ang_vel_error = torch.square(commands[:, 2] - base_ang_vel[:, 2])
-    rew_lin_vel_xy = torch.exp(-lin_vel_error/0.25) * rew_scales["lin_vel_xy"]
-    rew_ang_vel_z = torch.exp(-ang_vel_error/0.25) * rew_scales["ang_vel_z"]
+    lin_vel_error = torch.sum((commands[:, :2] - base_lin_vel[:, :2]) ** 2, dim=1)
+    ang_vel_error = (commands[:, 2] - base_ang_vel[:, 2]) ** 2
 
-    rew_torque = torch.sum(torch.square(torques), dim=1) * rew_scales["torque"]
+    rew_lin_vel_xy = torch.exp(-lin_vel_error / 0.25) * rew_scales.get("lin_vel_xy", 1.0)
+    rew_ang_vel_z = torch.exp(-ang_vel_error / 0.25) * rew_scales.get("ang_vel_z", 0.5)
 
-    total_reward = rew_lin_vel_xy + rew_ang_vel_z + rew_torque
-    total_reward = torch.clip(total_reward, 0., None)
-    reset = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.
-    reset = reset | torch.any(torch.norm(contact_forces[:, knee_indices, :], dim=2) > 1., dim=1)
-    time_out = episode_lengths >= max_episode_length - 1  # no terminal reward for time-outs
-    reset = reset | time_out
+    # ----------------------------
+    # Contact detection
+    # foot order: [FL, FR, RL, RR]
+    # Trot diagonals: (FL + RR) and (FR + RL)
+    # ----------------------------
+    contact_thresh = 1.0
+    foot_forces = torch.norm(contact_forces[:, feet_indices, :], dim=2)
+    foot_contact = (foot_forces > contact_thresh).float()
+
+    # Diagonal pairs for trotting
+    diagonal1 = foot_contact[:, 0] * foot_contact[:, 3]  # FL + RR
+    diagonal2 = foot_contact[:, 1] * foot_contact[:, 2]  # FR + RL
     
-    consecutive_successes = -(lin_vel_error + ang_vel_error).mean()
-    return total_reward.detach(), reset, consecutive_successes
+    # ----------------------------
+    # Trot gait metrics
+    # ----------------------------
+    
+    # 1. Diagonal contact (one diagonal pair down, not both)
+    diagonal_contact = (diagonal1 + diagonal2).clamp(0, 1)
+    both_diagonals = diagonal1 * diagonal2  # Bad: all feet down
+    
+    # 2. Diagonal alternation (key characteristic of trot)
+    diagonal_alternation = diagonal_contact * (1.0 - both_diagonals)
+    
+    # 3. Duty cycle (percentage of time feet are in contact)
+    # Trot typically has 50-60% duty cycle (longer than bounding)
+    total_contact = foot_contact.sum(dim=1)
+    duty_cycle = total_contact / 4.0  # Normalized 0-1
+    # Ideal trot duty cycle around 0.5-0.6 (2 feet down at a time)
+    duty_cycle_score = torch.exp(-((duty_cycle - 0.5) ** 2) / 0.1)
+    
+    # 4. Prevent wrong pairs (front pair or rear pair together)
+    front_pair = foot_contact[:, 0] * foot_contact[:, 1]
+    rear_pair = foot_contact[:, 2] * foot_contact[:, 3]
+    wrong_pairs = front_pair + rear_pair
+    
+    # 5. Diagonal force symmetry (forces should be balanced in each diagonal)
+    diagonal1_symmetry = 1.0 - torch.abs(foot_forces[:, 0] - foot_forces[:, 3]) / (
+        foot_forces[:, 0] + foot_forces[:, 3] + 1e-6
+    )
+    diagonal2_symmetry = 1.0 - torch.abs(foot_forces[:, 1] - foot_forces[:, 2]) / (
+        foot_forces[:, 1] + foot_forces[:, 2] + 1e-6
+    )
+    diagonal_symmetry = (diagonal1_symmetry + diagonal2_symmetry) * 0.5 * diagonal_contact
+    
+    # 6. Stability (body should remain level during trot)
+    # Check roll and pitch angles
+    up_vec_local = torch.zeros(batch_size, 3, dtype=torch.float, device=device)
+    up_vec_local[:, 2] = 1.0
+    up_vec = quat_rotate(base_quat, up_vec_local)
+    
+    # Body levelness (up vector should point mostly upward)
+    body_level = up_vec[:, 2]  # Closer to 1.0 = more upright
+    stability_score = (body_level > 0.85).float()  # Within ~30 degrees
+    
+    # 7. Forward motion consistency
+    forward_velocity = base_lin_vel[:, 0]
+    moving_forward = (forward_velocity > 0.1).float()
+    velocity_consistency = moving_forward * diagonal_contact
+    
+    # 8. Minimal lateral drift (trot should be straight)
+    lateral_drift = torch.abs(base_lin_vel[:, 1])
+    drift_penalty = torch.exp(-lateral_drift / 0.5)
+    
+    # 9. Height consistency (CoM should stay relatively constant)
+    base_height = root_states[:, 2]
+    # Penalize if too low (crouching) or bouncing too much
+    height_score = torch.exp(-((base_height - 0.35) ** 2) / 0.05)  # Target ~0.35m
+    
+    
+    
+    # ----------------------------
+    # Trot quality score
+    # ----------------------------
+    trot_quality = (
+        diagonal_alternation * 0.30 +    # 30%: Correct diagonal contacts
+        duty_cycle_score * 0.15 +         # 15%: Appropriate duty cycle
+        diagonal_symmetry * 0.20 +        # 20%: Diagonal force balance
+        stability_score * 0.15 +          # 15%: Body stability
+        velocity_consistency * 0.10 +     # 10%: Consistent forward motion
+        drift_penalty * 0.10              # 10%: Minimal lateral drift
+    )
+    
+    # Penalties for incorrect gait patterns
+    wrong_pair_penalty = wrong_pairs * rew_scales.get("wrong_pair_penalty", -0.3)
+    both_diag_penalty = both_diagonals * rew_scales.get("both_diag_penalty", -0.4)
+    
+    # ----------------------------
+    # Rewards
+    # ----------------------------
+    rew_trot = trot_quality * rew_scales.get("trot", 2.0)
+    rew_torque = -torch.sum(torch.abs(torques), dim=1) * rew_scales.get("torque", 0.0001)
+    rew_height = height_score * rew_scales.get("height", 0.3)
+    
+    # Energy efficiency (smooth, consistent motion)
+    torque_smoothness = -torch.sum(torques ** 2, dim=1) * rew_scales.get("smoothness", 0.0001)
+    
+    total_reward = (
+        rew_lin_vel_xy + 
+        rew_ang_vel_z + 
+        rew_trot + 
+        rew_torque + 
+        rew_height +
+        torque_smoothness +
+        wrong_pair_penalty +
+        both_diag_penalty
+    )
+    
+    # ----------------------------
+    # Reset conditions
+    # ----------------------------
+    base_contact = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.0
+    
+    # Robot tilted too much (more lenient than bounding)
+    tilted = up_vec[:, 2] < 0.3  # ~72 degrees (trot is more stable)
+    
+    # Height failure (too low or flipped)
+    height_fail = (base_height < 0.15) | (base_height > 0.6)
+    
+    reset = base_contact | tilted | height_fail
+    time_out = episode_lengths >= max_episode_length - 1
+    reset = reset | time_out
+
+    # ----------------------------
+    # Success metric (temporal consistency)
+    # ----------------------------
+    # Success = consistent trotting over time
+    is_success = (trot_quality > 0.65) & (wrong_pairs < 0.5)
+    consecutive_successes = torch.where(
+        is_success,
+        consecutive_successes + 1,
+        torch.zeros_like(consecutive_successes)
+    )
+    
+    # Normalized success (for logging)
+    # Trot needs longer consistency than bounding (20+ steps)
+    success_rate = (consecutive_successes > 20).float().mean()
+
+    return total_reward.detach(), reset, success_rate

@@ -1,30 +1,3 @@
-# Copyright (c) 2018-2023, NVIDIA Corporation
-# All rights reserved.
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice, this
-#    list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-#    this list of conditions and the following disclaimer in the documentation
-#    and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-#    contributors may be used to endorse or promote products derived from
-#    this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
 import os
@@ -39,7 +12,7 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 from typing import Tuple, Dict
 
 
-class Go2w(VecTask):
+class Go2wWalkClaude(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
 
@@ -170,9 +143,7 @@ class Go2w(VecTask):
     def _create_envs(self, num_envs, spacing, num_per_row):
         asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../assets')
         asset_file = "urdf/go2w/urdf/go2w.urdf"
-        #asset_path = os.path.join(asset_root, asset_file)
-        #asset_root = os.path.dirname(asset_path)
-        #asset_file = os.path.basename(asset_path)
+        
 
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_EFFORT
@@ -297,9 +268,6 @@ class Go2w(VecTask):
             gymtorch.unwrap_tensor(dof_torques)
         )
 
-    
-
-
     def post_physics_step(self):
         self.progress_buf += 1
 
@@ -311,22 +279,23 @@ class Go2w(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.reset_buf[:], self.consecutive_successes[:] = compute_go2w_reward(
-            # tensors
+        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_pos, self.default_dof_pos, self.dof_vel, self.actions, self.contact_forces, self.leg_dof_indices, self.wheel_dof_indices, self.gravity_vec)
+        self.extras['gpt_reward'] = self.rew_buf.mean()
+        for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
+        self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
             self.root_states,
             self.commands,
             self.torques,
             self.contact_forces,
             self.feet_indices,
+            self.dof_vel[:, self.wheel_dof_indices],
             self.consecutive_successes,
             self.progress_buf,
-            # Dict
             self.rew_scales,
-            # other
             self.base_index,
             self.max_episode_length,
         )
-
+        self.extras['gt_reward'] = self.gt_rew_buf.mean()
         self.extras['consecutive_successes'] = self.consecutive_successes.mean() 
 
     def compute_observations(self):
@@ -353,7 +322,6 @@ class Go2w(VecTask):
         )
 
     def reset_idx(self, env_ids):
-        # Randomization can happen only at reset time, since it can reset actor positions on GPU
         if self.randomize:
             self.apply_randomizations(self.randomization_params)
 
@@ -425,53 +393,285 @@ def compute_go2w_observations(root_states,
 
     return obs
 
-#####################################################################
-###=========================jit functions=========================###
-#####################################################################
+def quat_to_rpy(q):
+    """
+    Convert quaternion to roll, pitch, yaw.
+    
+    Args:
+        q: Tensor of shape (N, 4) in (x, y, z, w) format
+    
+    Returns:
+        roll, pitch, yaw: each of shape (N,)
+    """
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+
+    # Roll (x-axis rotation)
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(sinr, cosr)
+
+    # Pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = torch.clamp(sinp, -1.0, 1.0)  # numerical safety
+    pitch = torch.asin(sinp)
+
+    # Yaw (z-axis rotation)
+    siny = 2.0 * (w * z + x * y)
+    cosy = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny, cosy)
+
+    return roll, pitch, yaw
 
 
 @torch.jit.script
-def compute_go2w_reward(
-    # tensors
+#### Walking Task Success Function ####
+def compute_success(
     root_states,
     commands,
     torques,
     contact_forces,
     feet_indices,
+    wheel_dof_vel,
     consecutive_successes,
     episode_lengths,
-    # Dict
     rew_scales,
-    # other
     base_index,
     max_episode_length
 ):
-    # (reward, reset, feet_in air, feet_air_time, episode sums)
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
 
-    # prepare quantities (TODO: return from obs ?)
     base_quat = root_states[:, 3:7]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13])
 
-    # velocity tracking reward
-    lin_vel_error = torch.sum(torch.square(commands[:, :2] - base_lin_vel[:, :2]), dim=1)
-    ang_vel_error = torch.square(commands[:, 2] - base_ang_vel[:, 2])
-    rew_lin_vel_xy = torch.exp(-lin_vel_error/0.25) * rew_scales["lin_vel_xy"]
-    rew_ang_vel_z = torch.exp(-ang_vel_error/0.25) * rew_scales["ang_vel_z"]
+    vx_cmd = commands[:, 0]
 
-    # torque penalty
+    # -------------------------
+    # Contact logic
+    # -------------------------
+    feet_contact = torch.norm(
+        contact_forces[:, feet_indices, :], dim=2
+    )
+    foot_in_contact = feet_contact > 1.0
+
+    num_feet_contact = torch.sum(foot_in_contact, dim=1)
+
+    # At least one foot in air → stepping
+    stepping = num_feet_contact <= (len(feet_indices) - 1)
+
+    # -------------------------
+    # Forward walking
+    # -------------------------
+    forward_speed = base_lin_vel[:, 0]
+    moving_forward = forward_speed > 0.3
+
+    # -------------------------
+    # Wheel suppression
+    # -------------------------
+    wheel_speed = torch.mean(
+        torch.abs(wheel_dof_vel), dim=1
+    )
+    wheels_quiet = wheel_speed < 1.0
+
+    # -------------------------
+    # Base stability
+    # -------------------------
+    upright = torch.norm(torch.abs(base_ang_vel[:, :2]), p=2, dim=1) < 1.0
+
+    # -------------------------
+    # Command-conditioned success
+    # -------------------------
+    walk_cmd = vx_cmd > 0.0
+    idle_cmd = vx_cmd <= 0.0
+
+    legged_walk_success = (
+        moving_forward &
+        stepping &
+        wheels_quiet &
+        upright
+    )
+
+    idle_success = (
+        (torch.norm(base_lin_vel[:, :2], p=2, dim=1) < 0.2) &
+        (torch.norm(base_ang_vel, p=2, dim=1) < 0.5) &
+        (num_feet_contact >= len(feet_indices) - 1)
+    )
+
+    success = torch.where(
+        walk_cmd,
+        legged_walk_success,
+        idle_success
+    )
+
+    # -------------------------
+    # Reset logic
+    # -------------------------
+    base_contact = torch.norm(contact_forces[:, base_index, :], p=2, dim=1) > 1.0
+
+    time_out = episode_lengths >= max_episode_length - 1
+    reset = base_contact | time_out
+
+    consecutive_successes = success.float()
+    consecutive_successes = consecutive_successes.mean()
+
+    # -------------------------
+    # Rewards
     rew_torque = torch.sum(torch.square(torques), dim=1) * rew_scales["torque"]
-
-    total_reward = rew_lin_vel_xy + rew_ang_vel_z + rew_torque
+    total_reward = rew_torque
     total_reward = torch.clip(total_reward, 0., None)
-    # reset agents
-    reset = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.
-    reset = reset | torch.any(torch.norm(contact_forces[:, feet_indices, :], dim=2) > 1., dim=1)
-    time_out = episode_lengths >= max_episode_length - 1  # no terminal reward for time-outs
-    reset = reset | time_out
-    
-    consecutive_successes = -(lin_vel_error + ang_vel_error).mean()
 
-    # total_reward = -(lin_vel_error + ang_vel_error)
+
     return total_reward.detach(), reset, consecutive_successes
+
+
+
+
+from typing import Tuple, Dict
+import math
+import torch
+from torch import Tensor
+@torch.jit.script
+def compute_reward(
+    root_states: torch.Tensor,
+    commands: torch.Tensor,
+    dof_pos: torch.Tensor,
+    default_dof_pos: torch.Tensor,
+    dof_vel: torch.Tensor,
+    actions: torch.Tensor,
+    contact_forces: torch.Tensor,
+    leg_dof_indices: torch.Tensor,
+    wheel_dof_indices: torch.Tensor,
+    gravity_vec: torch.Tensor
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    
+    # Extract state information
+    base_quat = root_states[:, 3:7]
+    base_lin_vel = root_states[:, 7:10]
+    base_ang_vel = root_states[:, 10:13]
+    
+    # Transform velocities to body frame
+    base_lin_vel_body = quat_rotate_inverse(base_quat, base_lin_vel)
+    
+    # Extract commanded velocities
+    cmd_vx = commands[:, 0]
+    
+    # Compute whether robot should be walking
+    is_walking = torch.abs(cmd_vx) > 0.1
+    
+    # === Reward 1: Forward velocity tracking ===
+    velocity_tracking_error = torch.square(base_lin_vel_body[:, 0] - cmd_vx)
+    velocity_temp = 0.25
+    velocity_reward = torch.exp(-velocity_tracking_error / velocity_temp)
+    
+    # === Reward 2: Minimize lateral velocity ===
+    lateral_vel_error = torch.square(base_lin_vel_body[:, 1])
+    lateral_temp = 0.15
+    lateral_reward = torch.exp(-lateral_vel_error / lateral_temp)
+    
+    # === Reward 3: Minimize vertical velocity ===
+    vertical_vel_error = torch.square(base_lin_vel_body[:, 2])
+    vertical_temp = 0.15
+    vertical_reward = torch.exp(-vertical_vel_error / vertical_temp)
+    
+    # === Reward 4: STRICT wheel velocity penalty ===
+    wheel_dof_vel = dof_vel[:, wheel_dof_indices]
+    wheel_vel_squared = torch.sum(torch.square(wheel_dof_vel), dim=-1)
+    wheel_vel_temp = 0.5  # Much stricter (was 2.0)
+    wheel_passive_reward = torch.exp(-wheel_vel_squared / wheel_vel_temp)
+    
+    # === Reward 5: STRICT wheel torque penalty ===
+    wheel_actions = actions[:, wheel_dof_indices]
+    wheel_torque_squared = torch.sum(torch.square(wheel_actions), dim=-1)
+    wheel_torque_temp = 0.3  # Much stricter (was 1.0)
+    wheel_torque_reward = torch.exp(-wheel_torque_squared / wheel_torque_temp)
+    
+    # === Reward 6: Encourage leg joint velocities when walking ===
+    leg_dof_vel = dof_vel[:, leg_dof_indices]
+    leg_vel_magnitude = torch.sum(torch.abs(leg_dof_vel), dim=-1)
+    leg_motion_temp = 3.0
+    # Reward higher leg velocities when walking
+    leg_motion_reward = torch.where(
+        is_walking,
+        torch.tanh(leg_vel_magnitude / leg_motion_temp),  # Encourage motion
+        torch.exp(-leg_vel_magnitude / leg_motion_temp)   # Penalize when idle
+    )
+    
+    # === Reward 7: Foot clearance - reward lifting feet ===
+    num_feet = 4
+    foot_contact_forces = contact_forces[:, :num_feet, :]
+    foot_contact_magnitude = torch.norm(foot_contact_forces, dim=-1)
+    is_contact = foot_contact_magnitude > 1.0
+    num_feet_in_air = torch.sum(~is_contact, dim=-1).float()
+    
+    # Reward having 1-2 feet in air when walking (alternating gait)
+    foot_clearance_temp = 1.0
+    ideal_feet_in_air = 1.5
+    feet_in_air_error = torch.square(num_feet_in_air - ideal_feet_in_air)
+    foot_clearance_reward = torch.where(
+        is_walking,
+        torch.exp(-feet_in_air_error / foot_clearance_temp),
+        torch.exp(-num_feet_in_air / foot_clearance_temp)  # All feet down when idle
+    )
+    
+    # === Reward 8: Upright orientation ===
+    projected_gravity = quat_rotate_inverse(base_quat, gravity_vec)
+    upright_error = torch.square(projected_gravity[:, 2] + 1.0)
+    upright_temp = 0.3
+    upright_reward = torch.exp(-upright_error / upright_temp)
+    
+    # === Reward 9: Minimize base angular velocity ===
+    ang_vel_squared = torch.sum(torch.square(base_ang_vel), dim=-1)
+    ang_vel_temp = 0.25  # Stricter (was 0.5)
+    ang_vel_reward = torch.exp(-ang_vel_squared / ang_vel_temp)
+    
+    # === Reward 10: Leg action magnitude when walking ===
+    leg_actions = actions[:, leg_dof_indices]
+    leg_action_magnitude = torch.sum(torch.abs(leg_actions), dim=-1)
+    leg_action_temp = 8.0
+    # Encourage leg actions when walking, minimize when idle
+    leg_action_reward = torch.where(
+        is_walking,
+        torch.tanh(leg_action_magnitude / leg_action_temp),  # Encourage
+        torch.exp(-leg_action_magnitude / leg_action_temp)   # Minimize
+    )
+    
+    # === Reward 11: Gait frequency - encourage rhythmic motion ===
+    # Sum of absolute velocities across leg joints
+    leg_vel_variance = torch.var(leg_dof_vel, dim=-1)
+    gait_temp = 2.0
+    gait_rhythm_reward = torch.where(
+        is_walking,
+        torch.tanh(leg_vel_variance / gait_temp),
+        torch.zeros_like(leg_vel_variance)
+    )
+    
+    # Combine rewards with adjusted weights
+    reward = (
+        3.0 * velocity_reward +                    # Increased priority
+        0.5 * lateral_reward +
+        0.5 * vertical_reward +
+        3.0 * wheel_passive_reward +               # Much higher weight
+        3.0 * wheel_torque_reward +                # Much higher weight
+        2.0 * leg_motion_reward +                  # Increased priority
+        1.5 * foot_clearance_reward +              # New - encourage stepping
+        1.0 * upright_reward +
+        1.5 * ang_vel_reward +                     # Increased
+        1.5 * leg_action_reward +                  # New - encourage leg use
+        0.5 * gait_rhythm_reward                   # New - rhythmic gait
+    )
+    
+    reward_components = {
+        "velocity_reward": velocity_reward,
+        "lateral_reward": lateral_reward,
+        "vertical_reward": vertical_reward,
+        "wheel_passive_reward": wheel_passive_reward,
+        "wheel_torque_reward": wheel_torque_reward,
+        "leg_motion_reward": leg_motion_reward,
+        "foot_clearance_reward": foot_clearance_reward,
+        "upright_reward": upright_reward,
+        "ang_vel_reward": ang_vel_reward,
+        "leg_action_reward": leg_action_reward,
+        "gait_rhythm_reward": gait_rhythm_reward
+    }
+    
+    return reward, reward_components

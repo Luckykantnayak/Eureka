@@ -1,3 +1,30 @@
+# Copyright (c) 2018-2023, NVIDIA Corporation
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+#    list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+#    this list of conditions and the following disclaimer in the documentation
+#    and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+#    contributors may be used to endorse or promote products derived from
+#    this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import numpy as np
 import os
@@ -12,34 +39,40 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 from typing import Tuple, Dict
 
 
-class Go2Claude(VecTask):
+class Go2Bound(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
 
         self.cfg = cfg
         
+        # normalization
         self.lin_vel_scale = self.cfg["env"]["learn"]["linearVelocityScale"]
         self.ang_vel_scale = self.cfg["env"]["learn"]["angularVelocityScale"]
         self.dof_pos_scale = self.cfg["env"]["learn"]["dofPositionScale"]
         self.dof_vel_scale = self.cfg["env"]["learn"]["dofVelocityScale"]
         self.action_scale = self.cfg["env"]["control"]["actionScale"]
 
+        # reward scales
         self.rew_scales = {}
         self.rew_scales["lin_vel_xy"] = self.cfg["env"]["learn"]["linearVelocityXYRewardScale"]
         self.rew_scales["ang_vel_z"] = self.cfg["env"]["learn"]["angularVelocityZRewardScale"]
         self.rew_scales["torque"] = self.cfg["env"]["learn"]["torqueRewardScale"]
 
+        # randomization
         self.randomization_params = self.cfg["task"]["randomization_params"]
         self.randomize = self.cfg["task"]["randomize"]
 
+        # command ranges
         self.command_x_range = self.cfg["env"]["randomCommandVelocityRanges"]["linear_x"]
         self.command_y_range = self.cfg["env"]["randomCommandVelocityRanges"]["linear_y"]
         self.command_yaw_range = self.cfg["env"]["randomCommandVelocityRanges"]["yaw"]
 
+        # plane params
         self.plane_static_friction = self.cfg["env"]["plane"]["staticFriction"]
         self.plane_dynamic_friction = self.cfg["env"]["plane"]["dynamicFriction"]
         self.plane_restitution = self.cfg["env"]["plane"]["restitution"]
 
+        # base init state
         pos = self.cfg["env"]["baseInitState"]["pos"]
         rot = self.cfg["env"]["baseInitState"]["rot"]
         v_lin = self.cfg["env"]["baseInitState"]["vLinear"]
@@ -48,6 +81,7 @@ class Go2Claude(VecTask):
 
         self.base_init_state = state
 
+        # default joint positions
         self.named_default_joint_angles = self.cfg["env"]["defaultJointAngles"]
 
         self.cfg["env"]["numObservations"] = 48
@@ -55,6 +89,7 @@ class Go2Claude(VecTask):
 
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless, virtual_screen_capture=virtual_screen_capture, force_render=force_render)
 
+        # other
         self.dt = self.sim_params.dt
         self.max_episode_length_s = self.cfg["env"]["learn"]["episodeLength_s"]
         self.max_episode_length = int(self.max_episode_length_s / self.dt + 0.5)
@@ -71,6 +106,7 @@ class Go2Claude(VecTask):
             cam_target = gymapi.Vec3(lookat[0], lookat[1], lookat[2])
             self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
 
+        # get gym state tensors
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
         net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
@@ -81,6 +117,7 @@ class Go2Claude(VecTask):
         self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_dof_force_tensor(self.sim)
 
+        # create some wrapper tensors for different slices
         self.root_states = gymtorch.wrap_tensor(actor_root_state)
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
@@ -99,6 +136,7 @@ class Go2Claude(VecTask):
             angle = self.named_default_joint_angles[name]
             self.default_dof_pos[:, i] = angle
 
+        # initialize some data used later on
         self.extras = {}
         self.initial_root_states = self.root_states.clone()
         self.initial_root_states[:] = to_torch(self.base_init_state, device=self.device, requires_grad=False)
@@ -114,6 +152,7 @@ class Go2Claude(VecTask):
         self._create_ground_plane()
         self._create_envs(self.num_envs, self.cfg["env"]['envSpacing'], int(np.sqrt(self.num_envs)))
 
+        # If randomizing, apply once immediately on startup before the fist sim step
         if self.randomize:
             self.apply_randomizations(self.randomization_params)
 
@@ -128,6 +167,9 @@ class Go2Claude(VecTask):
     def _create_envs(self, num_envs, spacing, num_per_row):
         asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../assets')
         asset_file = "urdf/go2/urdf/go2.urdf"
+        #asset_path = os.path.join(asset_root, asset_file)
+        #asset_root = os.path.dirname(asset_path)
+        #asset_file = os.path.basename(asset_path)
 
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
@@ -170,6 +212,7 @@ class Go2Claude(VecTask):
         self.envs = []
 
         for i in range(self.num_envs):
+            # create env instance
             env_ptr = self.gym.create_env(self.sim, env_lower, env_upper, num_per_row)
             go2_handle = self.gym.create_actor(env_ptr, go2_asset, start_pose, "go2", i, 1, 0)
             self.gym.set_actor_dof_properties(env_ptr, go2_handle, dof_props)
@@ -200,10 +243,8 @@ class Go2Claude(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_pos, self.default_dof_pos, self.dof_vel, self.contact_forces, self.actions, self.dt)
-        self.extras['gpt_reward'] = self.rew_buf.mean()
-        for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
-        self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
+        self.rew_buf[:], self.reset_buf[:], self.consecutive_successes[:] = compute_go2_reward(
+            # tensors
             self.root_states,
             self.commands,
             self.torques,
@@ -211,11 +252,13 @@ class Go2Claude(VecTask):
             self.knee_indices,
             self.consecutive_successes,
             self.progress_buf,
+            # Dict
             self.rew_scales,
+            # other
             self.base_index,
             self.max_episode_length,
         )
-        self.extras['gt_reward'] = self.gt_rew_buf.mean()
+
         self.extras['consecutive_successes'] = self.consecutive_successes.mean() 
 
     def compute_observations(self):
@@ -232,6 +275,7 @@ class Go2Claude(VecTask):
                                                         self.dof_vel,
                                                         self.gravity_vec,
                                                         self.actions,
+                                                        # scales
                                                         self.lin_vel_scale,
                                                         self.ang_vel_scale,
                                                         self.dof_pos_scale,
@@ -239,6 +283,7 @@ class Go2Claude(VecTask):
         )
 
     def reset_idx(self, env_ids):
+        # Randomization can happen only at reset time, since it can reset actor positions on GPU
         if self.randomize:
             self.apply_randomizations(self.randomization_params)
 
@@ -299,10 +344,14 @@ def compute_go2_observations(root_states,
 
     return obs
 
+#####################################################################
+###=========================jit functions=========================###
+#####################################################################
 
 
 @torch.jit.script
-def compute_success(
+def compute_go2_reward(
+    # tensors
     root_states,
     commands,
     torques,
@@ -310,312 +359,37 @@ def compute_success(
     feet_indices,
     consecutive_successes,
     episode_lengths,
+    # Dict
     rew_scales,
+    # other
     base_index,
-    max_episode_length,
-    dt=0.02  # timestep
+    max_episode_length
 ):
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int, float) -> Tuple[Tensor, Tensor, Tensor]
+    # (reward, reset, feet_in air, feet_air_time, episode sums)
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
 
-    batch_size = root_states.shape[0]
-    device = root_states.device
-
-    # ----------------------------
-    # Base velocities
-    # ----------------------------
+    # prepare quantities (TODO: return from obs ?)
     base_quat = root_states[:, 3:7]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13])
 
-    lin_vel_error = torch.sum((commands[:, :2] - base_lin_vel[:, :2]) ** 2, dim=1)
-    ang_vel_error = (commands[:, 2] - base_ang_vel[:, 2]) ** 2
+    # velocity tracking reward
+    lin_vel_error = torch.sum(torch.square(commands[:, :2] - base_lin_vel[:, :2]), dim=1)
+    ang_vel_error = torch.square(commands[:, 2] - base_ang_vel[:, 2])
+    rew_lin_vel_xy = torch.exp(-lin_vel_error/0.25) * rew_scales["lin_vel_xy"]
+    rew_ang_vel_z = torch.exp(-ang_vel_error/0.25) * rew_scales["ang_vel_z"]
 
-    rew_lin_vel_xy = torch.exp(-lin_vel_error / 0.25) * rew_scales.get("lin_vel_xy", 1.0)
-    rew_ang_vel_z = torch.exp(-ang_vel_error / 0.25) * rew_scales.get("ang_vel_z", 0.5)
+    # torque penalty
+    rew_torque = torch.sum(torch.square(torques), dim=1) * rew_scales["torque"]
 
-    # ----------------------------
-    # Contact detection
-    # foot order: [FL, FR, RL, RR]
-    # Trot diagonals: (FL + RR) and (FR + RL)
-    # ----------------------------
-    contact_thresh = 1.0
-    foot_forces = torch.norm(contact_forces[:, feet_indices, :], dim=2)
-    foot_contact = (foot_forces > contact_thresh).float()
-
-    # Diagonal pairs for trotting
-    diagonal1 = foot_contact[:, 0] * foot_contact[:, 3]  # FL + RR
-    diagonal2 = foot_contact[:, 1] * foot_contact[:, 2]  # FR + RL
-    
-    # ----------------------------
-    # Trot gait metrics
-    # ----------------------------
-    
-    # 1. Diagonal contact (one diagonal pair down, not both)
-    diagonal_contact = (diagonal1 + diagonal2).clamp(0, 1)
-    both_diagonals = diagonal1 * diagonal2  # Bad: all feet down
-    
-    # 2. Diagonal alternation (key characteristic of trot)
-    diagonal_alternation = diagonal_contact * (1.0 - both_diagonals)
-    
-    # 3. Duty cycle (percentage of time feet are in contact)
-    # Trot typically has 50-60% duty cycle (longer than bounding)
-    total_contact = foot_contact.sum(dim=1)
-    duty_cycle = total_contact / 4.0  # Normalized 0-1
-    # Ideal trot duty cycle around 0.5-0.6 (2 feet down at a time)
-    duty_cycle_score = torch.exp(-((duty_cycle - 0.5) ** 2) / 0.1)
-    
-    # 4. Prevent wrong pairs (front pair or rear pair together)
-    front_pair = foot_contact[:, 0] * foot_contact[:, 1]
-    rear_pair = foot_contact[:, 2] * foot_contact[:, 3]
-    wrong_pairs = front_pair + rear_pair
-    
-    # 5. Diagonal force symmetry (forces should be balanced in each diagonal)
-    diagonal1_symmetry = 1.0 - torch.abs(foot_forces[:, 0] - foot_forces[:, 3]) / (
-        foot_forces[:, 0] + foot_forces[:, 3] + 1e-6
-    )
-    diagonal2_symmetry = 1.0 - torch.abs(foot_forces[:, 1] - foot_forces[:, 2]) / (
-        foot_forces[:, 1] + foot_forces[:, 2] + 1e-6
-    )
-    diagonal_symmetry = (diagonal1_symmetry + diagonal2_symmetry) * 0.5 * diagonal_contact
-    
-    # 6. Stability (body should remain level during trot)
-    # Check roll and pitch angles
-    up_vec_local = torch.zeros(batch_size, 3, dtype=torch.float, device=device)
-    up_vec_local[:, 2] = 1.0
-    up_vec = quat_rotate(base_quat, up_vec_local)
-    
-    # Body levelness (up vector should point mostly upward)
-    body_level = up_vec[:, 2]  # Closer to 1.0 = more upright
-    stability_score = (body_level > 0.85).float()  # Within ~30 degrees
-    
-    # 7. Forward motion consistency
-    forward_velocity = base_lin_vel[:, 0]
-    moving_forward = (forward_velocity > 0.1).float()
-    velocity_consistency = moving_forward * diagonal_contact
-    
-    # 8. Minimal lateral drift (trot should be straight)
-    lateral_drift = torch.abs(base_lin_vel[:, 1])
-    drift_penalty = torch.exp(-lateral_drift / 0.5)
-    
-    # 9. Height consistency (CoM should stay relatively constant)
-    base_height = root_states[:, 2]
-    # Penalize if too low (crouching) or bouncing too much
-    height_score = torch.exp(-((base_height - 0.35) ** 2) / 0.05)  # Target ~0.35m
-    
-    
-    
-    # ----------------------------
-    # Trot quality score
-    # ----------------------------
-    trot_quality = (
-        diagonal_alternation * 0.30 +    # 30%: Correct diagonal contacts
-        duty_cycle_score * 0.15 +         # 15%: Appropriate duty cycle
-        diagonal_symmetry * 0.20 +        # 20%: Diagonal force balance
-        stability_score * 0.15 +          # 15%: Body stability
-        velocity_consistency * 0.10 +     # 10%: Consistent forward motion
-        drift_penalty * 0.10              # 10%: Minimal lateral drift
-    )
-    
-    # Penalties for incorrect gait patterns
-    wrong_pair_penalty = wrong_pairs * rew_scales.get("wrong_pair_penalty", -0.3)
-    both_diag_penalty = both_diagonals * rew_scales.get("both_diag_penalty", -0.4)
-    
-    # ----------------------------
-    # Rewards
-    # ----------------------------
-    rew_trot = trot_quality * rew_scales.get("trot", 2.0)
-    rew_torque = -torch.sum(torch.abs(torques), dim=1) * rew_scales.get("torque", 0.0001)
-    rew_height = height_score * rew_scales.get("height", 0.3)
-    
-    # Energy efficiency (smooth, consistent motion)
-    torque_smoothness = -torch.sum(torques ** 2, dim=1) * rew_scales.get("smoothness", 0.0001)
-    
-    total_reward = (
-        rew_lin_vel_xy + 
-        rew_ang_vel_z + 
-        rew_trot + 
-        rew_torque + 
-        rew_height +
-        torque_smoothness +
-        wrong_pair_penalty +
-        both_diag_penalty
-    )
-    
-    # ----------------------------
-    # Reset conditions
-    # ----------------------------
-    base_contact = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.0
-    
-    # Robot tilted too much (more lenient than bounding)
-    tilted = up_vec[:, 2] < 0.3  # ~72 degrees (trot is more stable)
-    
-    # Height failure (too low or flipped)
-    height_fail = (base_height < 0.15) | (base_height > 0.6)
-    
-    reset = base_contact | tilted | height_fail
-    time_out = episode_lengths >= max_episode_length - 1
+    total_reward = rew_lin_vel_xy + rew_ang_vel_z + rew_torque
+    total_reward = torch.clip(total_reward, 0., None)
+    # reset agents
+    reset = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.
+    time_out = episode_lengths >= max_episode_length - 1  # no terminal reward for time-outs
     reset = reset | time_out
+    
+    consecutive_successes = -(lin_vel_error + ang_vel_error).mean()
 
-    # ----------------------------
-    # Success metric (temporal consistency)
-    # ----------------------------
-    # Success = consistent trotting over time
-    is_success = (trot_quality > 0.65) & (wrong_pairs < 0.5)
-    consecutive_successes = torch.where(
-        is_success,
-        consecutive_successes + 1,
-        torch.zeros_like(consecutive_successes)
-    )
-    
-    # Normalized success (for logging)
-    # Trot needs longer consistency than bounding (20+ steps)
-    success_rate = (consecutive_successes > 20).float().mean()
-
-    return total_reward.detach(), reset, success_rate
-from typing import Tuple, Dict
-import math
-import torch
-from torch import Tensor
-@torch.jit.script
-def compute_reward(
-    root_states: torch.Tensor,
-    commands: torch.Tensor,
-    dof_pos: torch.Tensor,
-    default_dof_pos: torch.Tensor,
-    dof_vel: torch.Tensor,
-    contact_forces: torch.Tensor,
-    actions: torch.Tensor,
-    dt: float
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    Reward function for quadruped trotting gait with velocity tracking.
-    
-    Args:
-        root_states: (num_envs, 13) tensor containing base position, orientation (quat), linear and angular velocities
-        commands: (num_envs, 3) tensor containing target [vx, vy, omega_z] commands
-        dof_pos: (num_envs, 12) tensor containing joint positions
-        default_dof_pos: (num_envs, 12) tensor containing default joint positions
-        dof_vel: (num_envs, 12) tensor containing joint velocities
-        contact_forces: (num_envs, 4, 3) tensor containing contact forces for 4 feet
-        actions: (num_envs, 12) tensor containing the actions
-        dt: timestep
-    """
-    # Extract base states
-    base_quat = root_states[:, 3:7]
-    base_lin_vel = root_states[:, 7:10]
-    base_ang_vel = root_states[:, 10:13]
-    
-    # Transform velocities to base frame
-    base_lin_vel_local = quat_rotate_inverse(base_quat, base_lin_vel)
-    base_ang_vel_local = quat_rotate_inverse(base_quat, base_ang_vel)
-    
-    # Gravity vector in base frame for orientation
-    gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=root_states.device, dtype=torch.float32)
-    projected_gravity = quat_rotate_inverse(base_quat, gravity_vec.repeat(root_states.shape[0], 1))
-    
-    # Contact detection (force threshold)
-    contact_threshold = 1.0
-    foot_contacts = torch.norm(contact_forces, dim=2) > contact_threshold  # (num_envs, 4)
-    
-    # Diagonal pairs: FL-RR (indices 0,3) and FR-RL (indices 1,2)
-    pair1_contact = foot_contacts[:, 0] & foot_contacts[:, 3]  # FL-RR
-    pair2_contact = foot_contacts[:, 1] & foot_contacts[:, 2]  # FR-RL
-    
-    # ===== 1. Velocity Tracking Reward =====
-    vel_error_x = torch.square(commands[:, 0] - base_lin_vel_local[:, 0])
-    vel_error_y = torch.square(commands[:, 1] - base_lin_vel_local[:, 1])
-    vel_error_yaw = torch.square(commands[:, 2] - base_ang_vel_local[:, 2])
-    
-    velocity_tracking_temp = 1.0
-    velocity_reward = torch.exp(-velocity_tracking_temp * (vel_error_x + vel_error_y + vel_error_yaw))
-    
-    # ===== 2. Trot Gait Pattern Reward =====
-    # Encourage alternating diagonal pairs
-    trot_pattern = (pair1_contact.float() - pair2_contact.float()).abs()
-    trot_gait_temp = 2.0
-    trot_reward = torch.exp(-trot_gait_temp * (1.0 - trot_pattern))
-    
-    # ===== 3. Aerial Phase Reward =====
-    # Encourage brief flight phases (neither pair in full contact)
-    num_feet_contact = foot_contacts.sum(dim=1)
-    aerial_phase = (num_feet_contact == 0).float()
-    flight_phase_bonus = aerial_phase * 0.1
-    
-    # ===== 4. Orientation Reward =====
-    # Penalize roll and pitch (keep torso upright)
-    up_vec_target = torch.tensor([0.0, 0.0, 1.0], device=root_states.device, dtype=torch.float32)
-    up_vec_target = up_vec_target.repeat(root_states.shape[0], 1)
-    up_vec = quat_rotate(base_quat, up_vec_target)
-    
-    orientation_error = torch.sum(torch.square(up_vec - up_vec_target), dim=1)
-    orientation_temp = 2.0
-    orientation_reward = torch.exp(-orientation_temp * orientation_error)
-    
-    # ===== 5. Angular Velocity Penalty (minimize unwanted rotation) =====
-    ang_vel_penalty_temp = 0.5
-    ang_vel_penalty = torch.exp(-ang_vel_penalty_temp * torch.sum(torch.square(base_ang_vel_local[:, :2]), dim=1))
-    
-    # ===== 6. Foot Slip Penalty =====
-    # Penalize lateral foot velocity when in contact
-    foot_slip_penalty = torch.tensor(0.0, device=root_states.device, dtype=torch.float32)
-    
-    # ===== 7. Joint Acceleration Penalty (smoothness) =====
-    joint_acc_temp = 0.01
-    joint_acc_penalty = torch.exp(-joint_acc_temp * torch.sum(torch.square(dof_vel), dim=1))
-    
-    # ===== 8. Action Rate Penalty (smoothness) =====
-    action_rate_temp = 0.01
-    action_rate_penalty = torch.exp(-action_rate_temp * torch.sum(torch.square(actions), dim=1))
-    
-    # ===== 9. Joint Limit Penalty =====
-    # Encourage staying away from joint limits
-    dof_pos_normalized = (dof_pos - default_dof_pos)
-    joint_limit_temp = 0.1
-    joint_limit_penalty = torch.exp(-joint_limit_temp * torch.sum(torch.square(dof_pos_normalized), dim=1))
-    
-    # ===== 10. Energy Efficiency =====
-    torque_penalty_temp = 0.0001
-    power = torch.sum(torch.square(actions) * torch.abs(dof_vel), dim=1)
-    energy_penalty = torch.exp(-torque_penalty_temp * power)
-    
-    # ===== 11. Forward Progress Reward =====
-    forward_progress_temp = 0.5
-    forward_progress = torch.clamp(base_lin_vel_local[:, 0], min=0.0)
-    forward_reward = torch.exp(-forward_progress_temp * torch.square(commands[:, 0] - forward_progress))
-    
-    # ===== 12. Foot Clearance Reward =====
-    # Encourage lifting feet during swing phase (simplified)
-    swing_pair1 = (~pair1_contact).float()
-    swing_pair2 = (~pair2_contact).float()
-    clearance_bonus = (swing_pair1 + swing_pair2) * 0.05
-    
-    # ===== Total Reward Composition =====
-    total_reward = (
-        3.0 * velocity_reward +
-        2.0 * trot_reward +
-        1.0 * orientation_reward +
-        0.5 * ang_vel_penalty +
-        0.3 * joint_acc_penalty +
-        0.2 * action_rate_penalty +
-        0.3 * joint_limit_penalty +
-        0.2 * energy_penalty +
-        1.5 * forward_reward +
-        flight_phase_bonus +
-        clearance_bonus
-    )
-    
-    reward_components = {
-        "velocity_reward": velocity_reward,
-        "trot_reward": trot_reward,
-        "orientation_reward": orientation_reward,
-        "ang_vel_penalty": ang_vel_penalty,
-        "joint_acc_penalty": joint_acc_penalty,
-        "action_rate_penalty": action_rate_penalty,
-        "joint_limit_penalty": joint_limit_penalty,
-        "energy_penalty": energy_penalty,
-        "forward_reward": forward_reward,
-        "flight_phase_bonus": flight_phase_bonus,
-        "clearance_bonus": clearance_bonus
-    }
-    
-    return total_reward, reward_components
+    # total_reward = -(lin_vel_error + ang_vel_error)
+    return total_reward.detach(), reset, consecutive_successes

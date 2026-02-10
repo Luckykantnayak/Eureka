@@ -39,7 +39,7 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 from typing import Tuple, Dict
 
 
-class Go2w(VecTask):
+class Go2wWalk(VecTask):
 
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
 
@@ -318,6 +318,7 @@ class Go2w(VecTask):
             self.torques,
             self.contact_forces,
             self.feet_indices,
+            self.dof_vel[:, self.wheel_dof_indices],
             self.consecutive_successes,
             self.progress_buf,
             # Dict
@@ -428,7 +429,34 @@ def compute_go2w_observations(root_states,
 #####################################################################
 ###=========================jit functions=========================###
 #####################################################################
+def quat_to_rpy(q):
+    """
+    Convert quaternion to roll, pitch, yaw.
+    
+    Args:
+        q: Tensor of shape (N, 4) in (x, y, z, w) format
+    
+    Returns:
+        roll, pitch, yaw: each of shape (N,)
+    """
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
 
+    # Roll (x-axis rotation)
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(sinr, cosr)
+
+    # Pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    sinp = torch.clamp(sinp, -1.0, 1.0)  # numerical safety
+    pitch = torch.asin(sinp)
+
+    # Yaw (z-axis rotation)
+    siny = 2.0 * (w * z + x * y)
+    cosy = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny, cosy)
+
+    return roll, pitch, yaw
 
 @torch.jit.script
 def compute_go2w_reward(
@@ -438,6 +466,7 @@ def compute_go2w_reward(
     torques,
     contact_forces,
     feet_indices,
+    wheel_dof_vel,
     consecutive_successes,
     episode_lengths,
     # Dict
@@ -447,7 +476,7 @@ def compute_go2w_reward(
     max_episode_length
 ):
     # (reward, reset, feet_in air, feet_air_time, episode sums)
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,  Dict[str, float], int, int) -> Tuple[Tensor, Tensor, Tensor]
 
     # prepare quantities (TODO: return from obs ?)
     base_quat = root_states[:, 3:7]
