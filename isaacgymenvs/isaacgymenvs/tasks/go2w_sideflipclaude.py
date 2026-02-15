@@ -279,7 +279,7 @@ class Go2wSideflipClaude(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_pos, self.default_dof_pos, self.dof_vel, self.actions, self.contact_forces, self.leg_dof_indices, self.wheel_dof_indices, self.gravity_vec)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_pos, self.default_dof_pos, self.dof_vel, self.actions, self.contact_forces, self.leg_dof_indices, self.wheel_dof_indices, self.reset_buf, self.progress_buf)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
@@ -725,135 +725,227 @@ def compute_reward(
     contact_forces: torch.Tensor,
     leg_dof_indices: torch.Tensor,
     wheel_dof_indices: torch.Tensor,
-    gravity_vec: torch.Tensor
+    reset_buf: torch.Tensor,
+    progress_buf: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     
-    # Extract state information
+    # Extract robot state
     base_quat = root_states[:, 3:7]
-    base_pos = root_states[:, :3]
+    base_pos = root_states[:, 0:3]
     base_lin_vel = root_states[:, 7:10]
     base_ang_vel = root_states[:, 10:13]
     
-    # Get commanded forward velocity
+    # Commanded forward velocity
     vx_cmd = commands[:, 0]
     
-    # Determine if flip should be performed (vx > 0) or idle (vx <= 0)
-    flip_mode = vx_cmd > 0.0
-    idle_mode = ~flip_mode
+    # Compute roll, pitch, yaw from quaternion
+    roll = torch.atan2(2.0 * (base_quat[:, 0] * base_quat[:, 1] + base_quat[:, 2] * base_quat[:, 3]),
+                       1.0 - 2.0 * (base_quat[:, 1]**2 + base_quat[:, 2]**2))
     
-    # Convert quaternion to euler angles to track roll
-    # Roll is rotation about x-axis
-    base_roll = torch.atan2(2.0 * (base_quat[:, 0] * base_quat[:, 1] + base_quat[:, 2] * base_quat[:, 3]),
-                            1.0 - 2.0 * (base_quat[:, 1]**2 + base_quat[:, 2]**2))
-    base_pitch = torch.asin(2.0 * (base_quat[:, 0] * base_quat[:, 2] - base_quat[:, 3] * base_quat[:, 1]))
-    base_yaw = torch.atan2(2.0 * (base_quat[:, 0] * base_quat[:, 3] + base_quat[:, 1] * base_quat[:, 2]),
-                           1.0 - 2.0 * (base_quat[:, 2]**2 + base_quat[:, 3]**2))
+    pitch = torch.asin(2.0 * (base_quat[:, 0] * base_quat[:, 2] - base_quat[:, 3] * base_quat[:, 1]))
     
-    # Compute angular velocity in body frame
-    body_ang_vel = quat_rotate_inverse(base_quat, base_ang_vel)
-    roll_vel = body_ang_vel[:, 0]
-    pitch_vel = body_ang_vel[:, 1]
-    yaw_vel = body_ang_vel[:, 2]
+    # Contact detection
+    total_contact_force = torch.norm(contact_forces.reshape(contact_forces.shape[0], -1, 3), dim=2).sum(dim=1)
+    is_airborne = total_contact_force < 5.0
+    is_grounded = ~is_airborne
     
-    # Check if feet/wheels are in contact with ground
-    contact_threshold = 1.0
-    num_contacts = torch.sum(torch.abs(contact_forces[:, :, 2]) > contact_threshold, dim=1)
-    is_airborne = num_contacts == 0
-    is_grounded = num_contacts > 0
+    # Base motion metrics
+    base_xy_vel = torch.norm(base_lin_vel[:, :2], dim=1)
+    base_z_vel = base_lin_vel[:, 2]
+    base_z = base_pos[:, 2]
     
-    # Translation in xy plane
-    xy_translation = torch.norm(base_lin_vel[:, :2], dim=-1)
+    # Angular velocities
+    roll_rate = base_ang_vel[:, 0]
+    roll_rate_abs = torch.abs(roll_rate)
+    pitch_rate = torch.abs(base_ang_vel[:, 1])
+    yaw_rate = torch.abs(base_ang_vel[:, 2])
     
-    # ===== FLIP MODE REWARDS =====
-    # Reward high roll angular velocity (encourages flip rotation)
-    roll_vel_reward_temp = 0.5
-    flip_roll_vel_reward = torch.exp(-torch.abs(roll_vel - 10.0) / roll_vel_reward_temp)
+    # Roll angle metrics
+    roll_abs = torch.abs(roll)
     
-    # Reward being airborne during flip
-    airborne_reward_temp = 1.0
-    flip_airborne_reward = torch.exp(num_contacts.float() / airborne_reward_temp)
+    # Leg and wheel actions
+    leg_dof_vel = dof_vel[:, leg_dof_indices]
+    wheel_dof_vel = dof_vel[:, wheel_dof_indices]
+    leg_actions = actions[:, leg_dof_indices]
+    wheel_actions = actions[:, wheel_dof_indices]
     
-    # Reward completing rotation (around 2*pi roll change)
-    # Encourage continuous rolling motion
-    roll_progress_reward_temp = 2.0
-    flip_roll_progress_reward = torch.exp(-torch.abs(torch.abs(roll_vel) - 6.28) / roll_progress_reward_temp)
+    # Determine behavior mode
+    should_flip = vx_cmd > 0.0
+    should_idle = vx_cmd <= 0.0
     
-    # Penalty for excessive translation during flip
-    translation_penalty_temp = 0.3
-    flip_translation_penalty = torch.exp(-xy_translation / translation_penalty_temp)
+    # Initialize reward components
+    takeoff_reward = torch.zeros_like(vx_cmd)
+    sustained_airborne = torch.zeros_like(vx_cmd)
+    height_reward = torch.zeros_like(vx_cmd)
+    roll_acceleration = torch.zeros_like(vx_cmd)
+    roll_velocity_reward = torch.zeros_like(vx_cmd)
+    quarter_flip = torch.zeros_like(vx_cmd)
+    half_flip = torch.zeros_like(vx_cmd)
+    three_quarter_flip = torch.zeros_like(vx_cmd)
+    full_flip = torch.zeros_like(vx_cmd)
+    landing_quality = torch.zeros_like(vx_cmd)
+    xy_stability = torch.zeros_like(vx_cmd)
+    orientation_penalty = torch.zeros_like(vx_cmd)
+    grounded_penalty = torch.zeros_like(vx_cmd)
+    idle_reward = torch.zeros_like(vx_cmd)
     
-    # Penalty for excessive pitch and yaw rotation during flip
-    pitch_penalty_temp = 1.0
-    flip_pitch_penalty = torch.exp(-torch.abs(pitch_vel) / pitch_penalty_temp)
-    yaw_penalty_temp = 1.0
-    flip_yaw_penalty = torch.exp(-torch.abs(yaw_vel) / yaw_penalty_temp)
+    # FLIP MODE
+    if should_flip.any():
+        # Phase 1: Takeoff (early episode)
+        # Reward jumping upward with high upward velocity
+        takeoff_temp = 0.3
+        upward_vel = torch.clamp(base_z_vel[should_flip], 0.0, 5.0)
+        takeoff_reward[should_flip] = torch.exp(takeoff_temp * upward_vel) * 3.0
+        
+        # Phase 2: Sustained airborne time
+        # Give continuous reward for being airborne to encourage staying in air
+        sustained_airborne[should_flip] = torch.where(
+            is_airborne[should_flip],
+            torch.ones_like(vx_cmd[should_flip]) * 8.0,
+            torch.zeros_like(vx_cmd[should_flip])
+        )
+        
+        # Phase 3: Height reward
+        # Encourage maintaining good height when airborne
+        height_temp = 0.8
+        target_height = 0.6
+        height_error = torch.abs(base_z[should_flip] - target_height)
+        height_reward[should_flip] = torch.where(
+            is_airborne[should_flip],
+            torch.exp(-height_temp * height_error) * 2.0,
+            torch.zeros_like(vx_cmd[should_flip])
+        )
+        
+        # Phase 4: Roll acceleration
+        # CRITICAL: Strongly reward initiating roll motion
+        # Target high angular acceleration to overcome inertia
+        roll_accel_temp = 0.15
+        roll_acceleration[should_flip] = torch.where(
+            is_airborne[should_flip],
+            torch.exp(roll_accel_temp * roll_rate_abs[should_flip]) * 5.0,
+            torch.zeros_like(vx_cmd[should_flip])
+        )
+        
+        # Phase 5: High roll velocity reward
+        # Exponentially reward higher roll rates
+        roll_vel_temp = 0.12
+        roll_velocity_reward[should_flip] = torch.where(
+            is_airborne[should_flip],
+            torch.exp(roll_vel_temp * roll_rate_abs[should_flip]) * 10.0,
+            torch.zeros_like(vx_cmd[should_flip])
+        )
+        
+        # Milestone rewards based on roll angle
+        # Quarter flip: π/2 (1.57 rad)
+        quarter_threshold = 1.3
+        quarter_flip[should_flip] = torch.where(
+            roll_abs[should_flip] > quarter_threshold,
+            torch.ones_like(vx_cmd[should_flip]) * 15.0,
+            torch.zeros_like(vx_cmd[should_flip])
+        )
+        
+        # Half flip: π (3.14 rad) - INVERTED
+        half_threshold = 2.5
+        half_flip[should_flip] = torch.where(
+            roll_abs[should_flip] > half_threshold,
+            torch.ones_like(vx_cmd[should_flip]) * 30.0,
+            torch.zeros_like(vx_cmd[should_flip])
+        )
+        
+        # Three-quarter flip: 3π/2 (4.71 rad)
+        # Since roll wraps at ±π, we need to check if robot passed through inversion
+        # and is coming back: check if roll_abs is decreasing from π
+        three_quarter_threshold = 2.0  # Coming back from inversion
+        was_inverted = roll_abs[should_flip] > half_threshold  # Already achieved inversion
+        three_quarter_flip[should_flip] = torch.where(
+            torch.logical_and(was_inverted, roll_abs[should_flip] < three_quarter_threshold),
+            torch.ones_like(vx_cmd[should_flip]) * 40.0,
+            torch.zeros_like(vx_cmd[should_flip])
+        )
+        
+        # Full flip: back to upright (roll_abs < 0.5) AFTER being inverted
+        near_upright = roll_abs[should_flip] < 0.5
+        # This requires tracking if robot was ever inverted - simplified: check if landed upright
+        full_flip[should_flip] = torch.where(
+            torch.logical_and(is_grounded[should_flip], near_upright),
+            torch.ones_like(vx_cmd[should_flip]) * 50.0,
+            torch.zeros_like(vx_cmd[should_flip])
+        )
+        
+        # Landing quality
+        # Reward stable landing with low velocities and near-upright orientation
+        landing_temp = 0.8
+        total_vel = torch.norm(base_lin_vel[should_flip], dim=1) + torch.norm(base_ang_vel[should_flip], dim=1)
+        landing_quality[should_flip] = torch.where(
+            torch.logical_and(is_grounded[should_flip], near_upright),
+            torch.exp(-landing_temp * total_vel) * 20.0,
+            torch.zeros_like(vx_cmd[should_flip])
+        )
+        
+        # XY stability - penalize horizontal translation
+        xy_temp = 1.0
+        xy_stability[should_flip] = -torch.exp(xy_temp * base_xy_vel[should_flip]) + 1.0
+        
+        # Orientation penalty - penalize pitch and yaw rotation
+        orient_temp = 0.3
+        unwanted_rotation = pitch_rate[should_flip] + yaw_rate[should_flip]
+        orientation_penalty[should_flip] = -torch.exp(orient_temp * unwanted_rotation) + 1.0
+        
+        # Grounded penalty - penalize staying on ground too long (after initial phase)
+        # Only apply after robot has had time to jump (progress_buf > 50)
+        early_phase = progress_buf[should_flip] < 50
+        grounded_penalty[should_flip] = torch.where(
+            torch.logical_and(~early_phase, is_grounded[should_flip]),
+            -torch.ones_like(vx_cmd[should_flip]) * 0.5,
+            torch.zeros_like(vx_cmd[should_flip])
+        )
     
-    # Reward for landing stability (low velocities when grounded)
-    landing_vel_penalty_temp = 0.5
-    flip_landing_stability = torch.exp(-torch.norm(base_lin_vel, dim=-1) / landing_vel_penalty_temp) * is_grounded.float()
+    # IDLE MODE
+    if should_idle.any():
+        idle_temp = 1.2
+        idle_reward[should_idle] = torch.exp(-idle_temp * (
+            torch.norm(base_lin_vel[should_idle], dim=1) + 
+            torch.norm(base_ang_vel[should_idle], dim=1) +
+            torch.norm(leg_dof_vel[should_idle], dim=1) / 10.0 +
+            torch.norm(leg_actions[should_idle], dim=1) / 5.0
+        )) * 2.0
     
-    # Combine flip rewards
-    flip_reward = (
-        2.0 * flip_roll_vel_reward +
-        1.5 * flip_airborne_reward +
-        1.0 * flip_roll_progress_reward +
-        1.0 * flip_translation_penalty +
-        0.5 * flip_pitch_penalty +
-        0.5 * flip_yaw_penalty +
-        1.0 * flip_landing_stability
-    )
+    # Combine rewards with carefully tuned weights
+    flip_total = (
+        2.0 * takeoff_reward +
+        3.0 * sustained_airborne +
+        1.0 * height_reward +
+        4.0 * roll_acceleration +
+        8.0 * roll_velocity_reward +
+        5.0 * quarter_flip +
+        10.0 * half_flip +
+        12.0 * three_quarter_flip +
+        15.0 * full_flip +
+        8.0 * landing_quality +
+        0.3 * xy_stability +
+        0.2 * orientation_penalty +
+        1.0 * grounded_penalty
+    ) * should_flip.float()
     
-    # ===== IDLE MODE REWARDS =====
-    # Reward staying grounded
-    idle_grounded_reward_temp = 1.0
-    idle_grounded_reward = torch.exp(-num_contacts.float() / idle_grounded_reward_temp)
+    idle_total = idle_reward * should_idle.float()
     
-    # Reward low base velocities
-    idle_lin_vel_penalty_temp = 0.3
-    idle_lin_vel_reward = torch.exp(-torch.norm(base_lin_vel, dim=-1) / idle_lin_vel_penalty_temp)
+    total_reward = flip_total + idle_total
     
-    idle_ang_vel_penalty_temp = 0.5
-    idle_ang_vel_reward = torch.exp(-torch.norm(base_ang_vel, dim=-1) / idle_ang_vel_penalty_temp)
-    
-    # Reward low joint velocities
-    dof_vel_magnitude = torch.norm(dof_vel, dim=-1)
-    idle_dof_vel_penalty_temp = 1.0
-    idle_dof_vel_reward = torch.exp(-dof_vel_magnitude / idle_dof_vel_penalty_temp)
-    
-    # Reward low action magnitude (low effort)
-    action_magnitude = torch.norm(actions, dim=-1)
-    idle_action_penalty_temp = 1.0
-    idle_action_reward = torch.exp(-action_magnitude / idle_action_penalty_temp)
-    
-    # Reward stable orientation (upright)
-    idle_orientation_penalty_temp = 1.0
-    idle_orientation_reward = torch.exp(-(torch.abs(base_roll) + torch.abs(base_pitch)) / idle_orientation_penalty_temp)
-    
-    # Combine idle rewards
-    idle_reward = (
-        2.0 * idle_grounded_reward +
-        1.5 * idle_lin_vel_reward +
-        1.5 * idle_ang_vel_reward +
-        1.0 * idle_dof_vel_reward +
-        1.0 * idle_action_reward +
-        1.0 * idle_orientation_reward
-    )
-    
-    # Select reward based on mode
-    total_reward = torch.where(flip_mode, flip_reward, idle_reward)
-    
-    # Reward components dictionary
     reward_components = {
-        "flip_roll_vel": flip_roll_vel_reward * flip_mode.float(),
-        "flip_airborne": flip_airborne_reward * flip_mode.float(),
-        "flip_roll_progress": flip_roll_progress_reward * flip_mode.float(),
-        "flip_translation_penalty": flip_translation_penalty * flip_mode.float(),
-        "flip_landing_stability": flip_landing_stability * flip_mode.float(),
-        "idle_grounded": idle_grounded_reward * idle_mode.float(),
-        "idle_lin_vel": idle_lin_vel_reward * idle_mode.float(),
-        "idle_ang_vel": idle_ang_vel_reward * idle_mode.float(),
-        "idle_dof_vel": idle_dof_vel_reward * idle_mode.float(),
-        "idle_action": idle_action_reward * idle_mode.float(),
+        "takeoff": takeoff_reward,
+        "sustained_airborne": sustained_airborne,
+        "height": height_reward,
+        "roll_acceleration": roll_acceleration,
+        "roll_velocity": roll_velocity_reward,
+        "quarter_flip": quarter_flip,
+        "half_flip": half_flip,
+        "three_quarter_flip": three_quarter_flip,
+        "full_flip": full_flip,
+        "landing_quality": landing_quality,
+        "xy_stability": xy_stability,
+        "orientation_penalty": orientation_penalty,
+        "grounded_penalty": grounded_penalty,
+        "idle": idle_reward,
     }
     
     return total_reward, reward_components

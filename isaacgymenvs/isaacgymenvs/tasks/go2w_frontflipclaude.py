@@ -279,7 +279,7 @@ class Go2wFrontflipClaude(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_pos, self.default_dof_pos, self.dof_vel, self.contact_forces, self.actions, self.leg_dof_indices, self.wheel_dof_indices, self.dt)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_pos, self.default_dof_pos, self.dof_vel, self.actions, self.contact_forces, self.leg_dof_indices, self.wheel_dof_indices, self.dt)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
@@ -685,8 +685,8 @@ def compute_reward(
     dof_pos: torch.Tensor,
     default_dof_pos: torch.Tensor,
     dof_vel: torch.Tensor,
-    contact_forces: torch.Tensor,
     actions: torch.Tensor,
+    contact_forces: torch.Tensor,
     leg_dof_indices: torch.Tensor,
     wheel_dof_indices: torch.Tensor,
     dt: float
@@ -694,240 +694,213 @@ def compute_reward(
     
     # Extract state information
     base_quat = root_states[:, 3:7]
-    base_pos = root_states[:, :3]
     base_lin_vel = root_states[:, 7:10]
     base_ang_vel = root_states[:, 10:13]
+    base_pos = root_states[:, :3]
     
-    # Determine if flip should be performed (vx > 0)
+    # Commanded forward velocity
     vx_cmd = commands[:, 0]
-    should_flip = vx_cmd > 0.0
     
-    # Compute gravity-aligned vectors
+    # Compute orientation
     gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=root_states.device).repeat(root_states.shape[0], 1)
     projected_gravity = quat_rotate(base_quat, gravity_vec)
-    up_vec = torch.tensor([0.0, 0.0, 1.0], device=root_states.device).repeat(root_states.shape[0], 1)
-    robot_up = quat_rotate(base_quat, up_vec)
     
-    # Forward direction
-    forward_vec = torch.tensor([1.0, 0.0, 0.0], device=root_states.device).repeat(root_states.shape[0], 1)
-    robot_forward = quat_rotate(base_quat, forward_vec)
+    # Pitch angle (rotation around lateral axis)
+    pitch = torch.atan2(projected_gravity[:, 0], -projected_gravity[:, 2])
     
-    # Detect airborne phase (low contact forces)
-    contact_threshold = 15.0
-    total_contact_force = torch.norm(contact_forces.view(contact_forces.shape[0], -1, 3), dim=2).sum(dim=1)
-    is_airborne = total_contact_force < contact_threshold
-    is_grounded = ~is_airborne
+    # Roll angle
+    roll = torch.atan2(projected_gravity[:, 1], -projected_gravity[:, 2])
     
-    # Height above ground
-    height = base_pos[:, 2]
+    # Upright score (1.0 when upright, 0.0 when inverted)
+    upright_score = -projected_gravity[:, 2]
     
-    # Angular velocity in local frame
-    base_ang_vel_local = quat_rotate_inverse(base_quat, base_ang_vel)
-    pitch_vel = base_ang_vel_local[:, 1]  # Forward rotation (positive = forward flip)
-    roll_vel = base_ang_vel_local[:, 0]
-    yaw_vel = base_ang_vel_local[:, 2]
+    # Base height
+    base_height = base_pos[:, 2]
     
-    # Upright alignment (z-component of up vector)
-    upright_alignment = robot_up[:, 2]
+    # Contact detection (assuming 4 feet)
+    foot_contact = torch.norm(contact_forces, dim=-1) > 1.0
+    num_feet_contact = torch.sum(foot_contact.view(root_states.shape[0], -1), dim=1)
     
-    # Forward alignment
-    forward_z = robot_forward[:, 2]
+    # Angular velocity in base frame
+    base_ang_vel_base = quat_rotate_inverse(base_quat, base_ang_vel)
+    pitch_vel = base_ang_vel_base[:, 1]  # Forward rotation velocity
     
-    # ===== Flip Mode Rewards (when vx > 0) =====
+    # Determine mode
+    should_flip = vx_cmd > 0.01
+    should_idle = vx_cmd <= 0.01
     
-    # Phase 1: Crouch reward - encourage low position while upright and grounded
-    crouch_target_height = 0.22
-    is_upright = upright_alignment > 0.85
-    crouch_quality = torch.exp(-((height - crouch_target_height) ** 2) / 0.01)
-    crouch_reward_temp = 0.3
-    crouch_reward = torch.where(
-        should_flip & is_grounded & is_upright,
-        crouch_quality / crouch_reward_temp * 2.0,
-        torch.zeros_like(height)
-    )
+    # Phase detection
+    on_ground = num_feet_contact >= 3
+    airborne = num_feet_contact < 2
     
-    # Phase 2: Launch reward - strong reward for high upward velocity when becoming airborne
+    # Vertical velocity
     upward_vel = base_lin_vel[:, 2]
-    launch_condition = is_airborne & (height > 0.3) & (upward_vel > 1.0)
-    launch_reward_temp = 0.8
+    
+    # Initialize reward components
+    reward_dict = {}
+    
+    # === FLIP MODE REWARDS ===
+    
+    # 1. Crouch reward - encourage low height when on ground (preparation)
+    crouch_height_target = 0.22
+    crouch_height_error = torch.abs(base_height - crouch_height_target)
+    crouch_temp = 0.05
+    crouch_reward = torch.where(
+        should_flip & on_ground & (base_height < 0.35),
+        torch.exp(-crouch_height_error / crouch_temp) * 2.0,
+        torch.zeros_like(base_height)
+    )
+    reward_dict["crouch"] = crouch_reward
+    
+    # 2. Launch reward - CRITICAL: reward any upward velocity
+    # Make this much more sensitive and rewarding
+    launch_temp = 0.5
     launch_reward = torch.where(
-        should_flip & launch_condition,
-        torch.exp(upward_vel / launch_reward_temp) * 5.0,
+        should_flip & (upward_vel > 0.1),  # Much lower threshold
+        torch.exp(upward_vel / launch_temp) * 10.0,  # Large multiplier
         torch.zeros_like(upward_vel)
     )
+    reward_dict["launch"] = launch_reward
     
-    # Phase 3: Airborne height reward - maintain sufficient height for rotation
-    min_flip_height = 0.5
-    is_high_enough = height > min_flip_height
-    height_reward_temp = 0.4
-    height_reward = torch.where(
-        should_flip & is_airborne & is_high_enough,
-        torch.exp((height - min_flip_height) / height_reward_temp) * 3.0,
-        torch.zeros_like(height)
+    # 3. Height reward - reward getting high
+    # Give massive rewards for being airborne at height
+    height_bonus = torch.where(
+        should_flip & airborne,
+        base_height * 20.0,  # Very large multiplier
+        torch.zeros_like(base_height)
     )
+    reward_dict["height"] = height_bonus
     
-    # Phase 4: Pitch rotation reward - continuous reward for forward pitch velocity while airborne and high
-    # Only reward positive pitch velocity (forward rotation)
-    pitch_speed_reward_temp = 4.0
-    valid_pitch_rotation = is_airborne & is_high_enough & (pitch_vel > 2.0)
-    pitch_speed_reward = torch.where(
-        should_flip & valid_pitch_rotation,
-        torch.exp(pitch_vel / pitch_speed_reward_temp) * 4.0,
-        torch.zeros_like(pitch_vel)
+    # 4. Rotation reward - reward pitch rotation when airborne
+    abs_pitch_vel = torch.abs(pitch_vel)
+    rotation_temp = 2.0
+    rotation_reward = torch.where(
+        should_flip & airborne,
+        torch.exp(abs_pitch_vel / rotation_temp) * 15.0,  # Very large reward
+        torch.zeros_like(abs_pitch_vel)
     )
+    reward_dict["rotation"] = rotation_reward
     
-    # Phase 5: Inversion bonus - reward being upside down while airborne and high
-    # This confirms actual flip rotation happened
-    is_inverted = upright_alignment < -0.5
-    inversion_bonus_reward = torch.where(
-        should_flip & is_airborne & is_high_enough & is_inverted,
-        10.0 * torch.ones_like(height),
-        torch.zeros_like(height)
+    # 5. High rotation speed bonus - extra reward for fast rotation
+    fast_rotation_bonus = torch.where(
+        should_flip & airborne & (abs_pitch_vel > 3.0),
+        abs_pitch_vel * 5.0,
+        torch.zeros_like(abs_pitch_vel)
     )
+    reward_dict["fast_rotation"] = fast_rotation_bonus
     
-    # Phase 6: Rotation completion - detect full rotation while airborne
-    # Full rotation = was inverted, now upright again, still airborne or just landed
-    rotation_complete = (upright_alignment > 0.7) & is_high_enough
-    rotation_completion_bonus = torch.where(
-        should_flip & rotation_complete & is_airborne,
-        15.0 * torch.ones_like(height),
-        torch.zeros_like(height)
+    # 6. Maintain height during rotation
+    height_during_rotation = torch.where(
+        should_flip & airborne & (base_height > 0.5),
+        10.0 * torch.ones_like(base_height),
+        torch.zeros_like(base_height)
     )
+    reward_dict["height_maintenance"] = height_during_rotation
     
-    # Phase 7: Landing reward - only after completing rotation
-    # Much smaller reward than before
-    post_rotation_landing = is_grounded & (upright_alignment > 0.75)
-    landing_upright_reward_temp = 0.15
+    # 7. Uprightness when descending (but only below certain height)
+    # This prevents the "hover at low height" exploit
+    upright_temp = 0.15
     landing_upright_reward = torch.where(
-        should_flip & post_rotation_landing,
-        torch.exp((upright_alignment - 0.75) / landing_upright_reward_temp) * 2.0,
-        torch.zeros_like(upright_alignment)
+        should_flip & (base_height < 0.5) & (base_height > 0.15) & (upward_vel < 0.0),  # Descending
+        torch.exp(upright_score / upright_temp) * 3.0,
+        torch.zeros_like(upright_score)
     )
+    reward_dict["landing_upright"] = landing_upright_reward
     
-    # Landing stability - low velocities after landing
-    total_vel = torch.norm(base_lin_vel, dim=1) + torch.norm(base_ang_vel, dim=1)
-    landing_stability_reward_temp = 1.5
-    landing_stability_reward = torch.where(
-        should_flip & is_grounded & (upright_alignment > 0.75) & (total_vel < 2.0),
-        torch.exp(-total_vel / landing_stability_reward_temp) * 1.5,
+    # 8. Landing reward - only when actually landing (touching down)
+    landing_quality = (num_feet_contact.float() / 4.0) * upright_score
+    landing_temp = 0.2
+    landing_reward = torch.where(
+        should_flip & on_ground & (upright_score > 0.7) & (base_height < 0.35),
+        torch.exp(landing_quality / landing_temp) * 5.0,  # Much smaller than before
+        torch.zeros_like(landing_quality)
+    )
+    reward_dict["landing"] = landing_reward
+    
+    # 9. Stability after landing
+    total_vel = torch.norm(base_lin_vel, dim=-1) + torch.norm(base_ang_vel, dim=-1)
+    stability_temp = 0.5
+    post_landing_reward = torch.where(
+        should_flip & on_ground & (upright_score > 0.8) & (base_height < 0.35),
+        torch.exp(-total_vel / stability_temp) * 2.0,
         torch.zeros_like(total_vel)
     )
+    reward_dict["post_landing"] = post_landing_reward
     
-    # Penalties
-    
-    # Penalize horizontal drift
+    # 10. Minimize horizontal drift during flip
     horizontal_vel = torch.sqrt(base_lin_vel[:, 0]**2 + base_lin_vel[:, 1]**2)
-    drift_penalty_temp = 1.5
     drift_penalty = torch.where(
         should_flip,
-        -horizontal_vel / drift_penalty_temp * 0.8,
+        -horizontal_vel * 2.0,
         torch.zeros_like(horizontal_vel)
     )
+    reward_dict["drift_penalty"] = drift_penalty
     
-    # Penalize excessive roll and yaw during flight
-    unwanted_rotation = torch.abs(roll_vel) + torch.abs(yaw_vel)
-    unwanted_rotation_penalty_temp = 4.0
-    unwanted_rotation_penalty = torch.where(
-        should_flip & is_airborne,
-        -unwanted_rotation / unwanted_rotation_penalty_temp * 1.2,
-        torch.zeros_like(unwanted_rotation)
+    # 11. Minimize roll deviation
+    roll_penalty = torch.where(
+        should_flip,
+        -torch.abs(roll) * 2.0,
+        torch.zeros_like(roll)
     )
+    reward_dict["roll_penalty"] = roll_penalty
     
-    # Penalize rotating while grounded (prevent cheating by rolling on ground)
-    ground_rotation_penalty = torch.where(
-        should_flip & is_grounded & (torch.abs(pitch_vel) > 1.0),
-        -5.0 * torch.ones_like(pitch_vel),
-        torch.zeros_like(pitch_vel)
+    # === IDLE MODE REWARDS ===
+    
+    # 12. Standing stability when idle
+    idle_upright = upright_score * (num_feet_contact.float() / 4.0)
+    idle_temp = 0.2
+    idle_reward = torch.where(
+        should_idle & on_ground,
+        torch.exp(idle_upright / idle_temp) * 1.0,
+        torch.zeros_like(idle_upright)
     )
+    reward_dict["idle_stability"] = idle_reward
     
-    # Penalize staying grounded without launching
-    time_penalty_for_grounded = torch.where(
-        should_flip & is_grounded & (upright_alignment > 0.7) & (height > 0.28),
-        -2.0 * torch.ones_like(height),
-        torch.zeros_like(height)
-    )
-    
-    # Penalize falling/tipping without proper launch
-    falling_without_launch = is_grounded & (upright_alignment < 0.7) & (height < 0.35)
-    falling_penalty = torch.where(
-        should_flip & falling_without_launch,
-        -8.0 * torch.ones_like(height),
-        torch.zeros_like(height)
-    )
-    
-    # ===== Idle Mode Rewards (when vx <= 0) =====
-    
-    # Maintain upright orientation
-    idle_upright_reward_temp = 0.08
-    idle_upright_reward = torch.where(
-        ~should_flip & is_upright,
-        torch.exp((upright_alignment - 0.85) / idle_upright_reward_temp) * 3.0,
-        torch.zeros_like(upright_alignment)
-    )
-    
-    # Stay grounded
-    idle_grounded_reward = torch.where(
-        ~should_flip & is_grounded,
-        1.5 * torch.ones_like(height),
-        torch.zeros_like(height)
-    )
-    
-    # Minimize motion
-    idle_motion_penalty_temp = 1.2
-    idle_motion = torch.norm(base_lin_vel, dim=1) + torch.norm(base_ang_vel, dim=1)
+    # 13. Minimal motion when idle
     idle_motion_penalty = torch.where(
-        ~should_flip,
-        -torch.exp(idle_motion / idle_motion_penalty_temp) * 0.8,
-        torch.zeros_like(idle_motion)
+        should_idle,
+        -total_vel * 1.0,
+        torch.zeros_like(total_vel)
     )
+    reward_dict["idle_motion_penalty"] = idle_motion_penalty
     
-    # Low actuation effort
-    action_magnitude = torch.norm(actions, dim=1)
+    # 14. Low actuation when idle
+    action_magnitude = torch.mean(torch.abs(actions), dim=-1)
     idle_effort_penalty = torch.where(
-        ~should_flip,
-        -action_magnitude * 0.15,
+        should_idle,
+        -action_magnitude * 0.5,
         torch.zeros_like(action_magnitude)
     )
+    reward_dict["idle_effort_penalty"] = idle_effort_penalty
     
-    # Total reward
+    # 15. Proper height when idle (standing, not crouching)
+    idle_height_target = 0.33
+    idle_height_error = torch.abs(base_height - idle_height_target)
+    idle_height_temp = 0.05
+    idle_height_reward = torch.where(
+        should_idle & on_ground,
+        torch.exp(-idle_height_error / idle_height_temp) * 0.5,
+        torch.zeros_like(base_height)
+    )
+    reward_dict["idle_height"] = idle_height_reward
+    
+    # Compute total reward
     total_reward = (
-        crouch_reward +
-        launch_reward +
-        height_reward +
-        pitch_speed_reward +
-        inversion_bonus_reward +
-        rotation_completion_bonus +
-        landing_upright_reward +
-        landing_stability_reward +
-        drift_penalty +
-        unwanted_rotation_penalty +
-        ground_rotation_penalty +
-        time_penalty_for_grounded +
-        falling_penalty +
-        idle_upright_reward +
-        idle_grounded_reward +
-        idle_motion_penalty +
-        idle_effort_penalty
+        reward_dict["crouch"] +
+        reward_dict["launch"] +
+        reward_dict["height"] +
+        reward_dict["rotation"] +
+        reward_dict["fast_rotation"] +
+        reward_dict["height_maintenance"] +
+        reward_dict["landing_upright"] +
+        reward_dict["landing"] +
+        reward_dict["post_landing"] +
+        reward_dict["drift_penalty"] +
+        reward_dict["roll_penalty"] +
+        reward_dict["idle_stability"] +
+        reward_dict["idle_motion_penalty"] +
+        reward_dict["idle_effort_penalty"] +
+        reward_dict["idle_height"]
     )
     
-    reward_components = {
-        "crouch_reward": crouch_reward,
-        "launch_reward": launch_reward,
-        "height_reward": height_reward,
-        "pitch_speed_reward": pitch_speed_reward,
-        "inversion_bonus_reward": inversion_bonus_reward,
-        "rotation_completion_bonus": rotation_completion_bonus,
-        "landing_upright_reward": landing_upright_reward,
-        "landing_stability_reward": landing_stability_reward,
-        "drift_penalty": drift_penalty,
-        "unwanted_rotation_penalty": unwanted_rotation_penalty,
-        "ground_rotation_penalty": ground_rotation_penalty,
-        "time_penalty_for_grounded": time_penalty_for_grounded,
-        "falling_penalty": falling_penalty,
-        "idle_upright_reward": idle_upright_reward,
-        "idle_grounded_reward": idle_grounded_reward,
-        "idle_motion_penalty": idle_motion_penalty,
-        "idle_effort_penalty": idle_effort_penalty
-    }
-    
-    return total_reward, reward_components
+    return total_reward, reward_dict

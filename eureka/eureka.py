@@ -74,6 +74,12 @@ def main(cfg):
     max_success_reward_correlation_overall = DUMMY_FAILURE
     max_reward_code_path = None 
     
+    # Token tracking variables
+    cumulative_input_tokens = 0
+    cumulative_output_tokens = 0
+    cumulative_total_tokens = 0
+    iteration_token_stats = []
+    
     # Eureka generation loop
     for iter in range(cfg.iteration):
         # Get Claude response
@@ -103,8 +109,16 @@ def main(cfg):
                             content += block.text
                     
                     responses.append({"message": {"content": content}})
-                    total_input_tokens += response.usage.input_tokens
-                    total_output_tokens += response.usage.output_tokens
+                    
+                    # Log token consumption per sample
+                    sample_input_tokens = response.usage.input_tokens
+                    sample_output_tokens = response.usage.output_tokens
+                    sample_total_tokens = sample_input_tokens + sample_output_tokens
+                    
+                    logging.info(f"  Sample {sample_idx}: Input Tokens: {sample_input_tokens}, Output Tokens: {sample_output_tokens}, Total: {sample_total_tokens}")
+                    
+                    total_input_tokens += sample_input_tokens
+                    total_output_tokens += sample_output_tokens
                     total_samples += 1
                     break
                     
@@ -122,8 +136,51 @@ def main(cfg):
         if cfg.sample == 1:
             logging.info(f"Iteration {iter}: Claude Output:\n " + responses[0]["message"]["content"] + "\n")
 
-        # Logging Token Information
-        logging.info(f"Iteration {iter}: Input Tokens: {total_input_tokens}, Output Tokens: {total_output_tokens}")
+        # Update cumulative token counts
+        cumulative_input_tokens += total_input_tokens
+        cumulative_output_tokens += total_output_tokens
+        total_tokens_this_iteration = total_input_tokens + total_output_tokens
+        cumulative_total_tokens += total_tokens_this_iteration
+        
+        # Store iteration stats
+        iteration_stats = {
+            'iteration': iter,
+            'input_tokens': total_input_tokens,
+            'output_tokens': total_output_tokens,
+            'total_tokens': total_tokens_this_iteration,
+            'cumulative_input_tokens': cumulative_input_tokens,
+            'cumulative_output_tokens': cumulative_output_tokens,
+            'cumulative_total_tokens': cumulative_total_tokens
+        }
+        iteration_token_stats.append(iteration_stats)
+        
+        # Logging Token Information - Enhanced
+        logging.info(f"=" * 80)
+        logging.info(f"ITERATION {iter} TOKEN CONSUMPTION SUMMARY")
+        logging.info(f"=" * 80)
+        logging.info(f"This Iteration:")
+        logging.info(f"  - Input Tokens:  {total_input_tokens:,}")
+        logging.info(f"  - Output Tokens: {total_output_tokens:,}")
+        logging.info(f"  - Total Tokens:  {total_tokens_this_iteration:,}")
+        logging.info(f"")
+        logging.info(f"Cumulative (up to Iteration {iter}):")
+        logging.info(f"  - Input Tokens:  {cumulative_input_tokens:,}")
+        logging.info(f"  - Output Tokens: {cumulative_output_tokens:,}")
+        logging.info(f"  - Total Tokens:  {cumulative_total_tokens:,}")
+        logging.info(f"=" * 80)
+        
+        # Save token statistics to JSON file
+        with open('token_consumption.json', 'w') as f:
+            json.dump({
+                'model': model,
+                'iterations': iteration_token_stats,
+                'summary': {
+                    'total_input_tokens': cumulative_input_tokens,
+                    'total_output_tokens': cumulative_output_tokens,
+                    'total_tokens': cumulative_total_tokens,
+                    'iterations_completed': iter + 1
+                }
+            }, f, indent=4)
         
         code_runs = [] 
         rl_runs = []
@@ -346,6 +403,19 @@ def main(cfg):
         # Save dictionary as JSON file
         with open('messages.json', 'w') as file:
             json.dump(messages, file, indent=4)
+    
+    # Log final token consumption summary
+    logging.info(f"\n")
+    logging.info(f"=" * 80)
+    logging.info(f"FINAL TOKEN CONSUMPTION SUMMARY")
+    logging.info(f"=" * 80)
+    logging.info(f"Model: {model}")
+    logging.info(f"Total Iterations: {cfg.iteration}")
+    logging.info(f"Total Input Tokens:  {cumulative_input_tokens:,}")
+    logging.info(f"Total Output Tokens: {cumulative_output_tokens:,}")
+    logging.info(f"Total Tokens:        {cumulative_total_tokens:,}")
+    logging.info(f"Average Tokens per Iteration: {cumulative_total_tokens / cfg.iteration:,.2f}")
+    logging.info(f"=" * 80)
     
     # Evaluate the best reward code many times
     if max_reward_code_path is None: 

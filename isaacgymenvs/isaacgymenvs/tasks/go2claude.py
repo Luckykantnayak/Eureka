@@ -200,7 +200,7 @@ class Go2Claude(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_pos, self.default_dof_pos, self.dof_vel, self.contact_forces, self.actions, self.dt)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_pos, self.default_dof_pos, self.dof_vel, self.contact_forces, self.actions, self.gravity_vec)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
@@ -485,137 +485,142 @@ def compute_reward(
     dof_vel: torch.Tensor,
     contact_forces: torch.Tensor,
     actions: torch.Tensor,
-    dt: float
+    gravity_vec: torch.Tensor
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    Reward function for quadruped trotting gait with velocity tracking.
     
-    Args:
-        root_states: (num_envs, 13) tensor containing base position, orientation (quat), linear and angular velocities
-        commands: (num_envs, 3) tensor containing target [vx, vy, omega_z] commands
-        dof_pos: (num_envs, 12) tensor containing joint positions
-        default_dof_pos: (num_envs, 12) tensor containing default joint positions
-        dof_vel: (num_envs, 12) tensor containing joint velocities
-        contact_forces: (num_envs, 4, 3) tensor containing contact forces for 4 feet
-        actions: (num_envs, 12) tensor containing the actions
-        dt: timestep
-    """
-    # Extract base states
+    # Extract base state information
     base_quat = root_states[:, 3:7]
     base_lin_vel = root_states[:, 7:10]
     base_ang_vel = root_states[:, 10:13]
     
-    # Transform velocities to base frame
+    # Transform velocities to local frame
     base_lin_vel_local = quat_rotate_inverse(base_quat, base_lin_vel)
     base_ang_vel_local = quat_rotate_inverse(base_quat, base_ang_vel)
     
-    # Gravity vector in base frame for orientation
-    gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=root_states.device, dtype=torch.float32)
-    projected_gravity = quat_rotate_inverse(base_quat, gravity_vec.repeat(root_states.shape[0], 1))
+    # Get projected gravity for orientation tracking
+    projected_gravity = quat_rotate_inverse(base_quat, gravity_vec)
     
-    # Contact detection (force threshold)
-    contact_threshold = 1.0
-    foot_contacts = torch.norm(contact_forces, dim=2) > contact_threshold  # (num_envs, 4)
+    # ===== PRIMARY OBJECTIVE: Velocity Tracking (CRITICAL - needs much higher weight) =====
+    target_x_vel = commands[:, 0]
+    current_x_vel = base_lin_vel_local[:, 0]
+    vel_error = torch.square(current_x_vel - target_x_vel)
+    vel_tracking_reward = torch.exp(-vel_error * 8.0)  # Increased from 2.0 to 8.0
     
-    # Diagonal pairs: FL-RR (indices 0,3) and FR-RL (indices 1,2)
-    pair1_contact = foot_contacts[:, 0] & foot_contacts[:, 3]  # FL-RR
-    pair2_contact = foot_contacts[:, 1] & foot_contacts[:, 2]  # FR-RL
+    # Penalize lateral and vertical velocities
+    lateral_vel_penalty = torch.square(base_lin_vel_local[:, 1])
+    vertical_vel_penalty = torch.square(base_lin_vel_local[:, 2])
+    velocity_constraint_reward = torch.exp(-5.0 * (lateral_vel_penalty + vertical_vel_penalty))
     
-    # ===== 1. Velocity Tracking Reward =====
-    vel_error_x = torch.square(commands[:, 0] - base_lin_vel_local[:, 0])
-    vel_error_y = torch.square(commands[:, 1] - base_lin_vel_local[:, 1])
-    vel_error_yaw = torch.square(commands[:, 2] - base_ang_vel_local[:, 2])
+    # ===== ORIENTATION STABILITY =====
+    # Keep torso upright
+    up_reward = torch.exp(-15.0 * torch.square(projected_gravity[:, 2] + 1.0))
     
-    velocity_tracking_temp = 1.0
-    velocity_reward = torch.exp(-velocity_tracking_temp * (vel_error_x + vel_error_y + vel_error_yaw))
+    # Minimize roll and pitch
+    roll_pitch_penalty = torch.square(projected_gravity[:, 0]) + torch.square(projected_gravity[:, 1])
+    orientation_reward = torch.exp(-8.0 * roll_pitch_penalty)
     
-    # ===== 2. Trot Gait Pattern Reward =====
-    # Encourage alternating diagonal pairs
-    trot_pattern = (pair1_contact.float() - pair2_contact.float()).abs()
-    trot_gait_temp = 2.0
-    trot_reward = torch.exp(-trot_gait_temp * (1.0 - trot_pattern))
+    # Minimize yaw rate
+    yaw_rate_penalty = torch.square(base_ang_vel_local[:, 2])
+    yaw_stability_reward = torch.exp(-3.0 * yaw_rate_penalty)
     
-    # ===== 3. Aerial Phase Reward =====
-    # Encourage brief flight phases (neither pair in full contact)
-    num_feet_contact = foot_contacts.sum(dim=1)
-    aerial_phase = (num_feet_contact == 0).float()
-    flight_phase_bonus = aerial_phase * 0.1
+    # ===== TROT GAIT PATTERN =====
+    # Legs: FL (0-2), FR (3-5), RL (6-8), RR (9-11)
+    # Focus on hip joints (joint 0 of each leg) for phase detection
+    fl_hip = dof_pos[:, 0]
+    fr_hip = dof_pos[:, 3]
+    rl_hip = dof_pos[:, 6]
+    rr_hip = dof_pos[:, 9]
     
-    # ===== 4. Orientation Reward =====
-    # Penalize roll and pitch (keep torso upright)
-    up_vec_target = torch.tensor([0.0, 0.0, 1.0], device=root_states.device, dtype=torch.float32)
-    up_vec_target = up_vec_target.repeat(root_states.shape[0], 1)
-    up_vec = quat_rotate(base_quat, up_vec_target)
+    # Diagonal pair synchronization (FL-RR and FR-RL should move together)
+    diag1_sync_error = torch.square(fl_hip - rr_hip)
+    diag2_sync_error = torch.square(fr_hip - rl_hip)
+    diagonal_sync_reward = torch.exp(-15.0 * (diag1_sync_error + diag2_sync_error))
     
-    orientation_error = torch.sum(torch.square(up_vec - up_vec_target), dim=1)
-    orientation_temp = 2.0
-    orientation_reward = torch.exp(-orientation_temp * orientation_error)
+    # Phase opposition between diagonal pairs (should be out of phase)
+    pair1_mean = (fl_hip + rr_hip) / 2.0
+    pair2_mean = (fr_hip + rl_hip) / 2.0
+    phase_diff = torch.square(pair1_mean + pair2_mean)  # Want them opposite, so sum near zero
+    phase_alternation_reward = torch.exp(-5.0 * phase_diff)
     
-    # ===== 5. Angular Velocity Penalty (minimize unwanted rotation) =====
-    ang_vel_penalty_temp = 0.5
-    ang_vel_penalty = torch.exp(-ang_vel_penalty_temp * torch.sum(torch.square(base_ang_vel_local[:, :2]), dim=1))
+    # ===== CONTACT PATTERN FOR TROT =====
+    fl_contact = torch.norm(contact_forces[:, -4, :], dim=-1)
+    fr_contact = torch.norm(contact_forces[:, -3, :], dim=-1)
+    rl_contact = torch.norm(contact_forces[:, -2, :], dim=-1)
+    rr_contact = torch.norm(contact_forces[:, -1, :], dim=-1)
     
-    # ===== 6. Foot Slip Penalty =====
-    # Penalize lateral foot velocity when in contact
-    foot_slip_penalty = torch.tensor(0.0, device=root_states.device, dtype=torch.float32)
+    # Diagonal pairs should have similar contact forces
+    diag1_contact_diff = torch.square(fl_contact - rr_contact)
+    diag2_contact_diff = torch.square(fr_contact - rl_contact)
+    contact_sync_reward = torch.exp(-0.005 * (diag1_contact_diff + diag2_contact_diff))
     
-    # ===== 7. Joint Acceleration Penalty (smoothness) =====
-    joint_acc_temp = 0.01
-    joint_acc_penalty = torch.exp(-joint_acc_temp * torch.sum(torch.square(dof_vel), dim=1))
+    # Encourage alternating contact (when one diagonal pair is in contact, other should be in air)
+    total_contact = fl_contact + fr_contact + rl_contact + rr_contact
+    contact_imbalance = torch.abs(total_contact / 2.0 - (fl_contact + rr_contact))
+    contact_alternation_reward = torch.exp(-0.003 * torch.square(contact_imbalance))
     
-    # ===== 8. Action Rate Penalty (smoothness) =====
-    action_rate_temp = 0.01
-    action_rate_penalty = torch.exp(-action_rate_temp * torch.sum(torch.square(actions), dim=1))
+    # ===== ENERGY EFFICIENCY =====
+    # Stronger penalty for deviating from default pose
+    joint_deviation = torch.sum(torch.square(dof_pos - default_dof_pos), dim=1)
+    energy_reward = torch.exp(-1.2 * joint_deviation)
     
-    # ===== 9. Joint Limit Penalty =====
-    # Encourage staying away from joint limits
-    dof_pos_normalized = (dof_pos - default_dof_pos)
-    joint_limit_temp = 0.1
-    joint_limit_penalty = torch.exp(-joint_limit_temp * torch.sum(torch.square(dof_pos_normalized), dim=1))
+    # Penalize excessive joint velocities
+    joint_vel_penalty = torch.sum(torch.square(dof_vel), dim=1)
+    smooth_motion_reward = torch.exp(-0.002 * joint_vel_penalty)
     
-    # ===== 10. Energy Efficiency =====
-    torque_penalty_temp = 0.0001
-    power = torch.sum(torch.square(actions) * torch.abs(dof_vel), dim=1)
-    energy_penalty = torch.exp(-torque_penalty_temp * power)
+    # ===== ACTION SMOOTHNESS =====
+    action_magnitude = torch.sum(torch.square(actions), dim=1)
+    action_smoothness_reward = torch.exp(-0.15 * action_magnitude)
     
-    # ===== 11. Forward Progress Reward =====
-    forward_progress_temp = 0.5
-    forward_progress = torch.clamp(base_lin_vel_local[:, 0], min=0.0)
-    forward_reward = torch.exp(-forward_progress_temp * torch.square(commands[:, 0] - forward_progress))
+    # ===== ANGULAR STABILITY =====
+    ang_vel_penalty = torch.square(base_ang_vel_local[:, 0]) + torch.square(base_ang_vel_local[:, 1])
+    angular_stability_reward = torch.exp(-2.0 * ang_vel_penalty)
     
-    # ===== 12. Foot Clearance Reward =====
-    # Encourage lifting feet during swing phase (simplified)
-    swing_pair1 = (~pair1_contact).float()
-    swing_pair2 = (~pair2_contact).float()
-    clearance_bonus = (swing_pair1 + swing_pair2) * 0.05
+    # ===== FEET CLEARANCE FOR TROT (NEW) =====
+    # Encourage feet to lift during swing phase
+    # Use knee joint velocities as proxy for swing
+    fl_knee_vel = torch.abs(dof_vel[:, 1])
+    fr_knee_vel = torch.abs(dof_vel[:, 4])
+    rl_knee_vel = torch.abs(dof_vel[:, 7])
+    rr_knee_vel = torch.abs(dof_vel[:, 10])
     
-    # ===== Total Reward Composition =====
-    total_reward = (
-        3.0 * velocity_reward +
-        2.0 * trot_reward +
+    # Diagonal pairs should have similar knee velocities
+    diag1_knee_sync = torch.exp(-2.0 * torch.square(fl_knee_vel - rr_knee_vel))
+    diag2_knee_sync = torch.exp(-2.0 * torch.square(fr_knee_vel - rl_knee_vel))
+    feet_clearance_reward = (diag1_knee_sync + diag2_knee_sync) / 2.0
+    
+    # Total reward with re-balanced weights
+    reward = (
+        10.0 * vel_tracking_reward +          # CRITICAL: Increased from 3.0
+        1.5 * velocity_constraint_reward +
+        1.0 * up_reward +
         1.0 * orientation_reward +
-        0.5 * ang_vel_penalty +
-        0.3 * joint_acc_penalty +
-        0.2 * action_rate_penalty +
-        0.3 * joint_limit_penalty +
-        0.2 * energy_penalty +
-        1.5 * forward_reward +
-        flight_phase_bonus +
-        clearance_bonus
+        0.8 * yaw_stability_reward +
+        3.0 * diagonal_sync_reward +          # Increased from 2.0
+        2.0 * phase_alternation_reward +      # Increased from 1.5
+        0.8 * contact_sync_reward +
+        1.0 * contact_alternation_reward +    # NEW
+        0.5 * energy_reward +                 # Increased from 0.3
+        0.3 * smooth_motion_reward +
+        0.4 * action_smoothness_reward +
+        0.8 * angular_stability_reward +
+        1.2 * feet_clearance_reward           # NEW
     )
     
     reward_components = {
-        "velocity_reward": velocity_reward,
-        "trot_reward": trot_reward,
-        "orientation_reward": orientation_reward,
-        "ang_vel_penalty": ang_vel_penalty,
-        "joint_acc_penalty": joint_acc_penalty,
-        "action_rate_penalty": action_rate_penalty,
-        "joint_limit_penalty": joint_limit_penalty,
-        "energy_penalty": energy_penalty,
-        "forward_reward": forward_reward,
-        "flight_phase_bonus": flight_phase_bonus,
-        "clearance_bonus": clearance_bonus
+        "vel_tracking": vel_tracking_reward,
+        "velocity_constraint": velocity_constraint_reward,
+        "up_reward": up_reward,
+        "orientation": orientation_reward,
+        "yaw_stability": yaw_stability_reward,
+        "diagonal_sync": diagonal_sync_reward,
+        "phase_alternation": phase_alternation_reward,
+        "contact_sync": contact_sync_reward,
+        "contact_alternation": contact_alternation_reward,
+        "energy": energy_reward,
+        "smooth_motion": smooth_motion_reward,
+        "action_smoothness": action_smoothness_reward,
+        "angular_stability": angular_stability_reward,
+        "feet_clearance": feet_clearance_reward
     }
     
-    return total_reward, reward_components
+    return reward, reward_components

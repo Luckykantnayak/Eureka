@@ -200,7 +200,7 @@ class Go2BoundClaude(VecTask):
         self.compute_reward(self.actions)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.dof_pos, self.dof_vel, self.contact_forces, self.commands, self.actions, self.default_dof_pos, self.gravity_vec)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.root_states, self.commands, self.dof_pos, self.dof_vel, self.contact_forces, self.actions, self.default_dof_pos, self.dt)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         self.gt_rew_buf, self.reset_buf[:], self.consecutive_successes[:] = compute_success(
@@ -530,174 +530,177 @@ from torch import Tensor
 @torch.jit.script
 def compute_reward(
     root_states: torch.Tensor,
+    commands: torch.Tensor,
     dof_pos: torch.Tensor,
     dof_vel: torch.Tensor,
     contact_forces: torch.Tensor,
-    commands: torch.Tensor,
     actions: torch.Tensor,
     default_dof_pos: torch.Tensor,
-    gravity_vec: torch.Tensor
+    dt: float
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Improved reward function for Go2 bounding gait.
-    """
+    Reward function for Go2 bounding gait with velocity tracking.
     
-    # Extract robot state
+    Args:
+        root_states: (num_envs, 13) root position, orientation, linear and angular velocities
+        commands: (num_envs, 3) commanded velocities [vx, vy, vyaw]
+        dof_pos: (num_envs, 12) joint positions
+        dof_vel: (num_envs, 12) joint velocities
+        contact_forces: (num_envs, 4, 3) contact forces for 4 feet [FL, FR, RL, RR]
+        actions: (num_envs, 12) actions
+        default_dof_pos: (num_envs, 12) default joint positions
+        dt: timestep
+    """
+    num_envs = root_states.shape[0]
+    device = root_states.device
+    
+    # Extract state information
     base_pos = root_states[:, :3]
     base_quat = root_states[:, 3:7]
     base_lin_vel = root_states[:, 7:10]
     base_ang_vel = root_states[:, 10:13]
     
-    # Transform velocities to body frame
+    # Convert to body frame
     base_lin_vel_body = quat_rotate_inverse(base_quat, base_lin_vel)
     base_ang_vel_body = quat_rotate_inverse(base_quat, base_ang_vel)
     
-    # Projected gravity for orientation
-    projected_gravity = quat_rotate_inverse(base_quat, gravity_vec)
+    # Compute contact state (threshold for contact detection)
+    contact_threshold: float = 1.0
+    contact_forces_norm = torch.norm(contact_forces, dim=-1)  # (num_envs, 4)
+    feet_in_contact = contact_forces_norm > contact_threshold  # (num_envs, 4)
     
-    # Device reference
-    device = root_states.device
+    # Feet indices: FL=0, FR=1, RL=2, RR=3
+    fl_contact = feet_in_contact[:, 0]
+    fr_contact = feet_in_contact[:, 1]
+    rl_contact = feet_in_contact[:, 2]
+    rr_contact = feet_in_contact[:, 3]
     
-    # Contact detection
-    contact_force_norm = torch.norm(contact_forces, dim=2)  # (N, 4)
-    contact_threshold = 1.0
-    contacts = contact_force_norm > contact_threshold  # (N, 4) [FL, FR, RL, RR]
+    # Bounding gait pattern rewards
+    # Front pair synchronized (both or neither)
+    front_sync = (fl_contact == fr_contact).float()
     
-    # Front and rear pair contacts
-    front_contacts = contacts[:, :2]  # FL, FR
-    rear_contacts = contacts[:, 2:]   # RL, RR
+    # Rear pair synchronized (both or neither)
+    rear_sync = (rl_contact == rr_contact).float()
     
-    front_pair_contact = torch.sum(front_contacts.float(), dim=1)  # (N,)
-    rear_pair_contact = torch.sum(rear_contacts.float(), dim=1)    # (N,)
-    total_contacts = front_pair_contact + rear_pair_contact
+    # Alternation: front and rear should not both be in contact (flight phase exists)
+    front_pair_contact = fl_contact & fr_contact
+    rear_pair_contact = rl_contact & rr_contact
+    no_simultaneous_contact = (~(front_pair_contact & rear_pair_contact)).float()
     
-    # Command analysis
-    cmd_x = commands[:, 0]
-    cmd_magnitude = torch.norm(commands[:, :2], dim=1)
-    is_moving = (cmd_magnitude >= 0.1).float()
-    should_stand = (cmd_magnitude < 0.1).float()
+    # Flight phase reward: all feet off ground
+    all_feet_off = (~(fl_contact | fr_contact | rl_contact | rr_contact)).float()
     
     # Temperature parameters
-    temp_vel_tracking = 0.2
-    temp_upright = 0.3
-    temp_ang_vel = 0.5
-    temp_height = 0.5
-    temp_vertical_vel = 1.0
-    temp_contact_timing = 1.0
-    temp_stand_vel = 0.3
+    temp_sync: float = 0.5
+    temp_alternation: float = 0.5
+    temp_flight: float = 0.3
     
-    # 1. Forward velocity tracking (increased importance)
-    vel_x = base_lin_vel_body[:, 0]
-    vel_y = base_lin_vel_body[:, 1]
-    vel_tracking_error = torch.square(vel_x - cmd_x) + torch.square(vel_y - commands[:, 1])
-    vel_tracking_reward = torch.exp(-vel_tracking_error / temp_vel_tracking)
+    # Gait pattern reward
+    gait_reward = torch.exp(temp_sync * front_sync) + torch.exp(temp_sync * rear_sync)
+    gait_reward += torch.exp(temp_alternation * no_simultaneous_contact)
+    gait_reward += torch.exp(temp_flight * all_feet_off)
     
-    # 2. Upright orientation reward (critical - keep body upright)
-    # Gravity should point down in body frame
-    upright_error = torch.square(projected_gravity[:, 0]) + torch.square(projected_gravity[:, 1])
-    upright_reward = torch.exp(-upright_error / temp_upright)
+    # Velocity tracking reward
+    cmd_vx = commands[:, 0]
+    cmd_vy = commands[:, 1]
+    cmd_vyaw = commands[:, 2]
     
-    # 3. Angular velocity penalty (minimize roll/yaw rotation)
-    ang_vel_xy = torch.square(base_ang_vel_body[:, 0]) + torch.square(base_ang_vel_body[:, 2])
-    ang_vel_reward = torch.exp(-ang_vel_xy / temp_ang_vel)
+    vx_error = torch.abs(base_lin_vel_body[:, 0] - cmd_vx)
+    vy_error = torch.abs(base_lin_vel_body[:, 1] - cmd_vy)
+    vyaw_error = torch.abs(base_ang_vel_body[:, 2] - cmd_vyaw)
     
-    # 4. Body height maintenance
-    base_height = root_states[:, 2]
-    target_height = 0.35
-    height_error = torch.square(base_height - target_height)
-    height_reward = torch.exp(-height_error / temp_height)
+    temp_vel: float = 0.5
+    vel_tracking_reward = torch.exp(-temp_vel * vx_error) + torch.exp(-temp_vel * vy_error) + torch.exp(-temp_vel * vyaw_error)
     
-    # 5. Vertical velocity reward (encourage explosive push-offs)
+    # Orientation reward (minimize roll and yaw, allow pitch variation)
+    gravity_vec = torch.tensor([0.0, 0.0, -1.0], device=device, dtype=torch.float32).repeat(num_envs, 1)
+    projected_gravity = quat_rotate_inverse(base_quat, gravity_vec)
+    
+    # Roll and yaw stability (upright orientation)
+    roll_pitch_error = torch.abs(projected_gravity[:, 0]) + torch.abs(projected_gravity[:, 1])
+    temp_orientation: float = 1.0
+    orientation_reward = torch.exp(-temp_orientation * roll_pitch_error)
+    
+    # Left-right force symmetry within pairs
+    fl_force = contact_forces_norm[:, 0]
+    fr_force = contact_forces_norm[:, 1]
+    rl_force = contact_forces_norm[:, 2]
+    rr_force = contact_forces_norm[:, 3]
+    
+    front_symmetry_error = torch.abs(fl_force - fr_force) / (fl_force + fr_force + 1e-6)
+    rear_symmetry_error = torch.abs(rl_force - rr_force) / (rl_force + rr_force + 1e-6)
+    
+    temp_symmetry: float = 2.0
+    symmetry_reward = torch.exp(-temp_symmetry * front_symmetry_error) + torch.exp(-temp_symmetry * rear_symmetry_error)
+    
+    # Joint velocity penalty (minimize slipping during contact)
+    dof_vel_penalty = torch.sum(torch.square(dof_vel), dim=-1)
+    temp_dof_vel: float = 0.01
+    dof_vel_reward = torch.exp(-temp_dof_vel * dof_vel_penalty)
+    
+    # Body height consistency
+    body_height = base_pos[:, 2]
+    target_height: float = 0.3
+    height_error = torch.abs(body_height - target_height)
+    temp_height: float = 5.0
+    height_reward = torch.exp(-temp_height * height_error)
+    
+    # Action smoothness penalty
+    action_diff = torch.sum(torch.square(actions), dim=-1)
+    temp_action: float = 0.01
+    action_reward = torch.exp(-temp_action * action_diff)
+    
+    # Standing reward when commanded velocity is near zero
+    cmd_norm = torch.norm(commands, dim=-1)
+    is_standing_cmd = cmd_norm < 0.1
+    
+    # Standing posture: all feet in contact, low velocities
+    all_feet_contact = (fl_contact & fr_contact & rl_contact & rr_contact).float()
+    low_vel = torch.norm(base_lin_vel, dim=-1) < 0.1
+    low_ang_vel = torch.norm(base_ang_vel, dim=-1) < 0.1
+    
+    standing_reward = is_standing_cmd.float() * all_feet_contact * low_vel.float() * low_ang_vel.float()
+    temp_standing: float = 1.0
+    standing_reward = torch.exp(temp_standing * standing_reward)
+    
+    # Explosive push-off reward (vertical velocity during takeoff)
     vertical_vel = base_lin_vel[:, 2]
-    # Reward positive vertical velocity during contact (push-off)
-    is_in_contact = (total_contacts > 0).float()
-    vertical_push_reward = is_in_contact * torch.clamp(vertical_vel, 0.0, 2.0)
-    vertical_vel_reward = torch.exp(vertical_push_reward / temp_vertical_vel) - 1.0
+    temp_vertical: float = 1.0
+    vertical_reward = torch.exp(temp_vertical * torch.clamp(vertical_vel, min=0.0, max=1.0))
     
-    # 6. Flight phase reward (encourage airborne time)
-    is_airborne = (total_contacts == 0).float()
-    flight_reward = is_airborne
+    # Total reward with weights
+    w_gait: float = 2.0
+    w_vel: float = 3.0
+    w_orient: float = 1.0
+    w_symmetry: float = 1.0
+    w_dof_vel: float = 0.5
+    w_height: float = 1.0
+    w_action: float = 0.1
+    w_standing: float = 1.5
+    w_vertical: float = 0.5
     
-    # 7. Pair synchronization (more discriminative)
-    # Both feet in pair should have similar contact state
-    front_both_contact = (front_pair_contact == 2).float()
-    front_no_contact = (front_pair_contact == 0).float()
-    front_sync_score = front_both_contact + front_no_contact
-    
-    rear_both_contact = (rear_pair_contact == 2).float()
-    rear_no_contact = (rear_pair_contact == 0).float()
-    rear_sync_score = rear_both_contact + rear_no_contact
-    
-    pair_sync_reward = 0.5 * (front_sync_score + rear_sync_score)
-    
-    # 8. Alternating gait (penalize all four feet or mixed contacts)
-    # Good states: 0 feet (flight), 2 front, 2 rear
-    good_contact_pattern = ((total_contacts == 0) | (total_contacts == 2)).float()
-    # Also check that when 2 contacts, they're from same pair
-    front_only = (front_pair_contact == 2) & (rear_pair_contact == 0)
-    rear_only = (rear_pair_contact == 2) & (front_pair_contact == 0)
-    valid_pair_contact = (front_only | rear_only).float()
-    
-    alternating_reward = good_contact_pattern * (1.0 + valid_pair_contact)
-    
-    # 9. Force symmetry within pairs (only when in contact)
-    front_in_contact = (front_pair_contact > 0).float()
-    rear_in_contact = (rear_pair_contact > 0).float()
-    
-    front_force_diff = torch.abs(contact_force_norm[:, 0] - contact_force_norm[:, 1])
-    rear_force_diff = torch.abs(contact_force_norm[:, 2] - contact_force_norm[:, 3])
-    
-    front_symmetry = front_in_contact * torch.exp(-front_force_diff / 50.0)
-    rear_symmetry = rear_in_contact * torch.exp(-rear_force_diff / 50.0)
-    force_symmetry_reward = 0.5 * (front_symmetry + rear_symmetry)
-    
-    # 10. Standing still reward (when commanded velocity is near zero)
-    standing_vel_error = torch.norm(base_lin_vel_body, dim=1) + torch.norm(base_ang_vel_body, dim=1)
-    standing_reward = should_stand * torch.exp(-standing_vel_error / temp_stand_vel) * (total_contacts == 4).float()
-    
-    # 11. Contact timing reward (encourage regular alternation)
-    # Penalize having same pair in contact for too long - implicitly via alternating reward
-    
-    # 12. Energy efficiency (limit joint velocities during stance)
-    joint_vel_norm = torch.mean(torch.square(dof_vel), dim=1)
-    energy_reward = is_in_contact * torch.exp(-joint_vel_norm / 100.0)
-    
-    # 13. Action smoothness
-    action_norm = torch.mean(torch.square(actions), dim=1)
-    action_reward = torch.exp(-action_norm / 2.0)
-    
-    # Combine rewards with adjusted weights
-    bounding_reward = (
-        5.0 * vel_tracking_reward +          # Increased: critical for task
-        4.0 * upright_reward +                # Increased: robot was falling
-        3.0 * ang_vel_reward +                # Increased: stability crucial
-        2.0 * height_reward +                 # Keep stable
-        2.0 * vertical_vel_reward +           # New emphasis on explosiveness
-        2.5 * flight_reward +                 # Increased: need more airtime
-        2.0 * pair_sync_reward +              # Keep important
-        3.0 * alternating_reward +            # Increased: core gait pattern
-        1.0 * force_symmetry_reward +         # Keep for balance
-        0.5 * energy_reward +                 # Minor consideration
-        0.5 * action_reward                   # Minor consideration
+    total_reward = (
+        w_gait * gait_reward +
+        w_vel * vel_tracking_reward +
+        w_orient * orientation_reward +
+        w_symmetry * symmetry_reward +
+        w_dof_vel * dof_vel_reward +
+        w_height * height_reward +
+        w_action * action_reward +
+        w_standing * standing_reward +
+        w_vertical * vertical_reward
     )
     
-    # Total reward
-    total_reward = is_moving * bounding_reward + standing_reward * 10.0
-    
-    # Reward components dictionary
     reward_components = {
-        "vel_tracking": vel_tracking_reward,
-        "upright": upright_reward,
-        "ang_vel": ang_vel_reward,
-        "height": height_reward,
-        "vertical_vel": vertical_vel_reward,
-        "flight": flight_reward,
-        "pair_sync": pair_sync_reward,
-        "alternating": alternating_reward,
-        "force_symmetry": force_symmetry_reward,
-        "standing": standing_reward,
-        "energy": energy_reward,
-        "action": action_reward
+        "gait_reward": gait_reward,
+        "vel_tracking_reward": vel_tracking_reward,
+        "orientation_reward": orientation_reward,
+        "symmetry_reward": symmetry_reward,
+        "dof_vel_reward": dof_vel_reward,
+        "height_reward": height_reward,
+        "action_reward": action_reward,
+        "standing_reward": standing_reward,
+        "vertical_reward": vertical_reward
     }
     
     return total_reward, reward_components

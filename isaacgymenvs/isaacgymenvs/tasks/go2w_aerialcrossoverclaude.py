@@ -509,190 +509,206 @@ def compute_reward(
     gravity_vec: torch.Tensor
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     
-    # Extract commanded velocities
-    cmd_vx = commands[:, 0]
-    cmd_vy = commands[:, 1]
-    cmd_yaw = commands[:, 2]
-    
-    # Extract base states
+    # Extract state information
     base_quat = root_states[:, 3:7]
-    base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
-    base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13])
-    base_height = root_states[:, 2]
+    base_lin_vel = root_states[:, 7:10]
+    base_ang_vel = root_states[:, 10:13]
     
-    # Projected gravity for orientation tracking
-    projected_gravity = quat_rotate(base_quat, gravity_vec)
+    # Transform velocities to body frame
+    base_lin_vel_body = quat_rotate_inverse(base_quat, base_lin_vel)
+    base_ang_vel_body = quat_rotate_inverse(base_quat, base_ang_vel)
     
-    # Get leg and wheel velocities
-    leg_dof_vel = dof_vel[:, leg_dof_indices]
-    wheel_dof_vel = dof_vel[:, wheel_dof_indices]
-    leg_dof_pos = dof_pos[:, leg_dof_indices]
+    # Extract commanded velocities
+    vx_cmd = commands[:, 0]
+    vy_cmd = commands[:, 1]
+    yaw_rate_cmd = commands[:, 2]
     
-    # Determine mode based on commanded forward velocity
-    forward_mode = cmd_vx > 0.1
+    # Determine mode: forward motion (vx > 0) vs stationary (vx <= 0)
+    forward_mode = vx_cmd > 0.0
     stationary_mode = ~forward_mode
     
-    # ===== Forward Mode Rewards (vx > 0.1) =====
+    # Extract wheel and leg DOF information
+    wheel_dof_vel = dof_vel[:, wheel_dof_indices]
+    leg_dof_pos = dof_pos[:, leg_dof_indices]
+    leg_dof_vel = dof_vel[:, leg_dof_indices]
     
-    # 1. Forward velocity tracking - use quadratic error with high temperature
-    forward_vel_temp: float = 6.0
-    forward_vel_error = torch.square(base_lin_vel[:, 0] - cmd_vx)
-    forward_vel_reward = torch.exp(-forward_vel_error / forward_vel_temp)
+    # Contact detection
+    num_bodies = contact_forces.shape[1]
+    foot_indices = torch.tensor([num_bodies-4, num_bodies-3, num_bodies-2, num_bodies-1], 
+                                device=contact_forces.device, dtype=torch.long)
+    foot_contact_forces = contact_forces[:, foot_indices, :]
+    foot_contact_z = torch.abs(foot_contact_forces[:, :, 2])
+    foot_in_contact = foot_contact_z > 1.0
     
-    # 2. Lateral velocity tracking
-    lateral_vel_temp: float = 0.5
-    lateral_vel_error = torch.abs(base_lin_vel[:, 1] - cmd_vy)
-    lateral_vel_reward = torch.exp(-lateral_vel_error / lateral_vel_temp)
+    # Projected gravity for orientation
+    projected_gravity = quat_rotate_inverse(base_quat, gravity_vec)
     
-    # 3. Yaw velocity tracking
-    yaw_vel_temp: float = 0.5
-    yaw_vel_error = torch.abs(base_ang_vel[:, 2] - cmd_yaw)
-    yaw_vel_reward = torch.exp(-yaw_vel_error / yaw_vel_temp)
+    # ===== FORWARD MODE REWARDS (vx > 0) =====
     
-    # 4. Wheel velocity - adaptive to commanded velocity
-    wheel_vel_temp: float = 3.0
-    target_wheel_vel = torch.clamp(cmd_vx * 2.5, min=2.0, max=10.0)
-    wheel_vel_magnitude = torch.abs(wheel_dof_vel).mean(dim=-1)
-    wheel_spinning_error = torch.abs(wheel_vel_magnitude - target_wheel_vel)
-    wheel_spinning_reward = torch.exp(-wheel_spinning_error / wheel_vel_temp)
+    # 1. Forward velocity tracking - use square error for smoother gradients
+    forward_vel_temp: float = 2.0
+    forward_vel_error_sq = (base_lin_vel_body[:, 0] - vx_cmd) ** 2
+    forward_vel_reward = torch.exp(-forward_vel_error_sq / forward_vel_temp)
     
-    # 5. REVISED: Leg motion reward - simple total velocity magnitude
+    # 2. Lateral and yaw tracking
+    tracking_temp: float = 0.4
+    lateral_vel_error = torch.abs(base_lin_vel_body[:, 1] - vy_cmd)
+    yaw_rate_error = torch.abs(base_ang_vel_body[:, 2] - yaw_rate_cmd)
+    tracking_reward = torch.exp(-(lateral_vel_error + yaw_rate_error) / tracking_temp)
+    
+    # 3. Wheel forward rotation - reward positive average wheel velocity
+    wheel_forward_temp: float = 4.0
+    avg_wheel_vel = torch.mean(wheel_dof_vel, dim=1)
+    # Reward when wheels spin forward (positive velocity)
+    wheel_forward_reward = torch.exp(-torch.clamp(-avg_wheel_vel, min=0.0) / wheel_forward_temp)
+    
+    # 4. Wheel contact maintenance
+    wheel_contact_temp: float = 0.25
+    vertical_vel_penalty = torch.abs(base_lin_vel_body[:, 2])
+    wheel_contact_reward = torch.exp(-vertical_vel_penalty / wheel_contact_temp)
+    
+    # 5. Diagonal leg synchronization - reward diagonal pairs moving together
+    # Hip pitch indices: FL=1, FR=4, RL=7, RR=10
+    hip_pitch_indices = torch.tensor([1, 4, 7, 10], device=leg_dof_pos.device, dtype=torch.long)
+    hip_pitch_pos = leg_dof_pos[:, hip_pitch_indices]
+    hip_pitch_vel = leg_dof_vel[:, hip_pitch_indices]
+    
+    # FL=0, FR=1, RL=2, RR=3 -> Diagonals: (FL,RR)=(0,3), (FR,RL)=(1,2)
+    # Reward when diagonal pairs are synchronized
+    diag1_sync_temp: float = 0.15
+    diag2_sync_temp: float = 0.15
+    diag1_pos_diff = torch.abs(hip_pitch_pos[:, 0] - hip_pitch_pos[:, 3])
+    diag2_pos_diff = torch.abs(hip_pitch_pos[:, 1] - hip_pitch_pos[:, 2])
+    
+    diag1_sync_reward = torch.exp(-diag1_pos_diff / diag1_sync_temp)
+    diag2_sync_reward = torch.exp(-diag2_pos_diff / diag2_sync_temp)
+    leg_sync_reward = (diag1_sync_reward + diag2_sync_reward) / 2.0
+    
+    # 6. Diagonal alternation - reward when one diagonal is up and other is down
+    alternation_temp: float = 0.3
+    diag1_avg = (hip_pitch_pos[:, 0] + hip_pitch_pos[:, 3]) / 2.0
+    diag2_avg = (hip_pitch_pos[:, 1] + hip_pitch_pos[:, 2]) / 2.0
+    diag_difference = torch.abs(diag1_avg - diag2_avg)
+    # Target difference of 0.4 radians between diagonal pairs
+    alternation_reward = torch.exp(-torch.abs(diag_difference - 0.4) / alternation_temp)
+    
+    # 7. Leg motion speed
     leg_motion_temp: float = 2.5
-    leg_vel_magnitude = torch.sum(torch.abs(leg_dof_vel), dim=-1)
-    # Target around 15-20 rad/s total across all leg joints
-    target_leg_vel: float = 18.0
-    leg_motion_error = torch.abs(leg_vel_magnitude - target_leg_vel)
-    leg_motion_reward = torch.exp(-leg_motion_error / leg_motion_temp)
+    leg_vel_magnitude = torch.norm(leg_dof_vel, dim=1)
+    leg_motion_reward = torch.exp(-torch.abs(leg_vel_magnitude - 7.0) / leg_motion_temp)
     
-    # 6. Diagonal leg coordination
-    diagonal_coord_temp: float = 2.0
-    if leg_dof_indices.shape[0] >= 12:
-        fl_vel = leg_dof_vel[:, 0]
-        fr_vel = leg_dof_vel[:, 3]
-        rl_vel = leg_dof_vel[:, 6]
-        rr_vel = leg_dof_vel[:, 9]
-        
-        diag1_sync = torch.abs(fl_vel - rr_vel)
-        diag2_sync = torch.abs(fr_vel - rl_vel)
-        diagonal_coord_error = (diag1_sync + diag2_sync) / 2.0
-        diagonal_coord_reward = torch.exp(-diagonal_coord_error / diagonal_coord_temp)
-    else:
-        diagonal_coord_reward = torch.zeros_like(cmd_vx)
+    # 8. Foot clearance during aerial phase (replace saturated minimal_contact)
+    # Get foot body positions (assuming feet are last 4 bodies)
+    # Since we don't have direct foot positions, use hip pitch as proxy for leg lift
+    clearance_temp: float = 0.2
+    # Reward when at least one diagonal pair has lifted legs
+    max_hip_pitch = torch.max(hip_pitch_pos, dim=1)[0]
+    foot_clearance_reward = torch.exp(-torch.clamp(0.3 - max_hip_pitch, min=0.0) / clearance_temp)
     
-    # 7. Upright orientation - RELAXED temperature for more tolerance
-    upright_temp: float = 0.8
-    upright_error = torch.sum(torch.square(projected_gravity[:, :2]), dim=-1)
-    upright_reward = torch.exp(-upright_error / upright_temp)
+    # 9. Orientation stability
+    upright_temp: float = 0.3
+    upright_reward = torch.exp(-torch.abs(projected_gravity[:, 2] + 1.0) / upright_temp)
     
-    # 8. Base height maintenance for forward motion
-    height_temp: float = 0.25
-    target_height: float = 0.28
-    height_error = torch.abs(base_height - target_height)
-    height_reward = torch.exp(-height_error / height_temp)
+    # 10. Energy efficiency - penalize excessive action magnitude
+    energy_temp: float = 10.0
+    action_magnitude = torch.norm(actions, dim=1)
+    energy_reward = torch.exp(-action_magnitude / energy_temp)
     
-    # 9. Action rate penalty
-    action_rate_temp: float = 50.0
-    action_rate = torch.sum(torch.square(actions), dim=-1)
-    action_smoothness = torch.exp(-action_rate / action_rate_temp)
-    
-    # 10. Wheel ground contact
-    wheel_contact_temp: float = 30.0
-    wheel_contact_forces = contact_forces[:, wheel_dof_indices, 2]  # z-component
-    wheel_contact_magnitude = torch.sum(torch.abs(wheel_contact_forces), dim=-1)
-    wheel_contact_reward = 1.0 - torch.exp(-wheel_contact_magnitude / wheel_contact_temp)
-    
-    # 11. Leg clearance reward - REDUCED temperature for better gradient
-    leg_clearance_temp: float = 0.08
-    leg_pos_deviation = torch.sum(torch.square(leg_dof_pos - default_dof_pos[:, leg_dof_indices]), dim=-1)
-    leg_clearance_reward = 1.0 - torch.exp(-leg_pos_deviation / leg_clearance_temp)
-    
-    # ===== Stationary Mode Rewards (vx <= 0.1) =====
+    # ===== STATIONARY MODE REWARDS (vx <= 0) - MASSIVELY RELAXED =====
     
     # 1. Zero linear velocity
-    stationary_lin_vel_temp: float = 0.3
-    stationary_lin_vel_penalty = torch.sum(torch.square(base_lin_vel), dim=-1)
-    stationary_lin_vel_reward = torch.exp(-stationary_lin_vel_penalty / stationary_lin_vel_temp)
+    stationary_vel_temp: float = 1.0
+    stationary_vel_penalty = torch.norm(base_lin_vel_body, dim=1)
+    stationary_vel_reward = torch.exp(-stationary_vel_penalty / stationary_vel_temp)
     
-    # 2. Zero angular velocity - slightly increased temperature
-    stationary_ang_vel_temp: float = 2.0
-    stationary_ang_vel_penalty = torch.sum(torch.square(base_ang_vel), dim=-1)
-    stationary_ang_vel_reward = torch.exp(-stationary_ang_vel_penalty / stationary_ang_vel_temp)
+    # 2. Zero angular velocity - MUCH MORE RELAXED
+    stationary_ang_temp: float = 2.0
+    stationary_ang_penalty = torch.norm(base_ang_vel_body, dim=1)
+    stationary_ang_reward = torch.exp(-stationary_ang_penalty / stationary_ang_temp)
     
-    # 3. Seated posture - try higher temperature for easier learning
-    seated_posture_temp: float = 5.0
-    seated_pos_error = torch.sum(torch.square(leg_dof_pos - default_dof_pos[:, leg_dof_indices]), dim=-1)
-    seated_posture_reward = torch.exp(-seated_pos_error / seated_posture_temp)
+    # 3. Seated posture - just reward hip flexion (legs bent)
+    seated_hip_temp: float = 0.8
+    # Want all hip pitches to be negative (legs bent forward)
+    hip_flexion = -torch.mean(hip_pitch_pos, dim=1)  # Negative pitch = forward bend
+    seated_hip_reward = torch.exp(-torch.clamp(-hip_flexion, min=0.0) / seated_hip_temp)
     
-    # 4. Wheel stationary - SIGNIFICANTLY increased temperature
-    wheel_stationary_temp: float = 120.0
-    wheel_vel_penalty = torch.sum(torch.square(wheel_dof_vel), dim=-1)
-    wheel_stationary_reward = torch.exp(-wheel_vel_penalty / wheel_stationary_temp)
+    # 4. Foot contact - simply reward having most feet in contact
+    contact_temp: float = 2.0
+    num_feet_contact = torch.sum(foot_in_contact.float(), dim=1)
+    seated_contact_reward = torch.exp(-torch.abs(num_feet_contact - 4.0) / contact_temp)
     
-    # 5. Leg stability - increased temperature
-    leg_stability_temp: float = 35.0
-    leg_vel_penalty = torch.sum(torch.square(leg_dof_vel), dim=-1)
-    leg_stability_reward = torch.exp(-leg_vel_penalty / leg_stability_temp)
+    # 5. Low leg velocity
+    seated_leg_still_temp: float = 5.0
+    seated_leg_vel_penalty = torch.norm(leg_dof_vel, dim=1)
+    seated_leg_still_reward = torch.exp(-seated_leg_vel_penalty / seated_leg_still_temp)
     
-    # 6. Low base height for seated posture
-    seated_height_temp: float = 0.18
-    seated_target_height: float = 0.18
-    seated_height_error = torch.abs(base_height - seated_target_height)
-    seated_height_reward = torch.exp(-seated_height_error / seated_height_temp)
+    # 6. Low wheel velocity
+    seated_wheel_still_temp: float = 5.0
+    seated_wheel_vel_penalty = torch.norm(wheel_dof_vel, dim=1)
+    seated_wheel_still_reward = torch.exp(-seated_wheel_vel_penalty / seated_wheel_still_temp)
     
-    # 7. Upright even in stationary mode
-    stationary_upright_reward = upright_reward
+    # 7. Base height stability
+    base_height_temp: float = 0.4
+    base_height = root_states[:, 2]
+    base_height_error = torch.abs(base_height - 0.28)
+    stationary_height_reward = torch.exp(-base_height_error / base_height_temp)
     
-    # ===== Combine Rewards Based on Mode =====
+    # 8. Low base pitch and roll
+    stationary_orient_temp: float = 0.5
+    base_pitch_roll = torch.sqrt(projected_gravity[:, 0]**2 + projected_gravity[:, 1]**2)
+    stationary_orient_reward = torch.exp(-base_pitch_roll / stationary_orient_temp)
     
-    # Forward mode: MAXIMUM priority on forward velocity
-    forward_mode_reward = (
-        15.0 * forward_vel_reward +           # INCREASED from 12.0 - absolute priority
-        2.0 * lateral_vel_reward +
-        2.0 * yaw_vel_reward +
-        2.5 * wheel_spinning_reward +
-        2.5 * leg_motion_reward +             # Increased slightly
-        1.5 * diagonal_coord_reward +
-        4.0 * upright_reward +                # Increased from 3.0 - critical for stability
-        1.5 * height_reward +
-        4.0 * wheel_contact_reward +
-        1.5 * leg_clearance_reward +          # Increased from 1.0
-        0.5 * action_smoothness
+    # ===== COMBINE REWARDS BASED ON MODE =====
+    
+    # Forward mode total reward
+    forward_total = (
+        6.0 * forward_vel_reward +
+        2.0 * tracking_reward +
+        2.0 * wheel_forward_reward +
+        2.0 * wheel_contact_reward +
+        2.0 * leg_sync_reward +
+        2.0 * alternation_reward +
+        1.5 * leg_motion_reward +
+        1.5 * foot_clearance_reward +
+        1.0 * upright_reward +
+        0.3 * energy_reward
     )
     
-    # Stationary mode: balanced priorities
-    stationary_mode_reward = (
-        6.0 * stationary_lin_vel_reward +
-        5.0 * stationary_ang_vel_reward +
-        5.0 * seated_posture_reward +         # Increased from 4.0
-        7.0 * wheel_stationary_reward +       # Increased from 6.0
-        4.0 * leg_stability_reward +          # Increased from 3.0
-        3.0 * seated_height_reward +
-        2.0 * stationary_upright_reward
+    # Stationary mode total reward
+    stationary_total = (
+        5.0 * stationary_vel_reward +
+        5.0 * stationary_ang_reward +
+        4.0 * seated_hip_reward +
+        3.0 * seated_contact_reward +
+        2.0 * seated_leg_still_reward +
+        2.0 * seated_wheel_still_reward +
+        2.0 * stationary_height_reward +
+        2.0 * stationary_orient_reward
     )
     
     # Select reward based on mode
-    total_reward = torch.where(forward_mode, forward_mode_reward, stationary_mode_reward)
+    total_reward = torch.where(forward_mode, forward_total, stationary_total)
     
-    # Create reward dictionary
-    reward_components = {
-        "forward_vel_reward": forward_vel_reward,
-        "lateral_vel_reward": lateral_vel_reward,
-        "yaw_vel_reward": yaw_vel_reward,
-        "wheel_spinning_reward": wheel_spinning_reward,
-        "leg_motion_reward": leg_motion_reward,
-        "diagonal_coord_reward": diagonal_coord_reward,
-        "upright_reward": upright_reward,
-        "height_reward": height_reward,
-        "action_smoothness": action_smoothness,
-        "wheel_contact_reward": wheel_contact_reward,
-        "leg_clearance_reward": leg_clearance_reward,
-        "stationary_lin_vel_reward": stationary_lin_vel_reward,
-        "stationary_ang_vel_reward": stationary_ang_vel_reward,
-        "seated_posture_reward": seated_posture_reward,
-        "wheel_stationary_reward": wheel_stationary_reward,
-        "leg_stability_reward": leg_stability_reward,
-        "seated_height_reward": seated_height_reward,
-        "total_reward": total_reward
+    # Build reward dictionary
+    reward_dict = {
+        'forward_vel_reward': forward_vel_reward,
+        'tracking_reward': tracking_reward,
+        'wheel_forward_reward': wheel_forward_reward,
+        'wheel_contact_reward': wheel_contact_reward,
+        'leg_sync_reward': leg_sync_reward,
+        'alternation_reward': alternation_reward,
+        'leg_motion_reward': leg_motion_reward,
+        'foot_clearance_reward': foot_clearance_reward,
+        'upright_reward': upright_reward,
+        'energy_reward': energy_reward,
+        'stationary_vel_reward': stationary_vel_reward,
+        'stationary_ang_reward': stationary_ang_reward,
+        'seated_hip_reward': seated_hip_reward,
+        'seated_contact_reward': seated_contact_reward,
+        'seated_leg_still_reward': seated_leg_still_reward,
+        'seated_wheel_still_reward': seated_wheel_still_reward,
+        'stationary_height_reward': stationary_height_reward,
+        'stationary_orient_reward': stationary_orient_reward
     }
     
-    return total_reward, reward_components
+    return total_reward, reward_dict
